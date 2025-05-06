@@ -1,0 +1,15 @@
+[package]
+name = "liquid-unstaker-client-cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap.workspace = true
+anchor-client = { workspace = true, features = ["async"]}
+anchor-spl = { workspace = true }
+liquid-unstaker = { path = "../programs/liquid-unstaker" }
+tokio = "^1.40"
+anyhow.workspace = true
+spl-stake-pool.workspace = true
+itertools.workspace = true
+solana-account-decoder.workspace = true
