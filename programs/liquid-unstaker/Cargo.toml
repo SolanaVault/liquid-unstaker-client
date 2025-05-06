@@ -1,0 +1,10 @@
+[package]
+name = "liquid-unstaker"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anchor-lang.workspace = true
+
+[dev-dependencies]
+anchor-gen = "0.3.1"
