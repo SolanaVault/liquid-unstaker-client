@@ -7,3 +7,17 @@ Available commands in the CLI
 - unstake-stake (TODO)
 - deposit SOL (TODO)
 - withdraw SOL (TODO)
+
+## Examples:
+
+### Get a quote for 0.01 vSOL from the main pool
+
+```
+liquid-unstaker-client-cli --pool 9nyw5jxhzuSs88HxKJyDCsWBZMhxj2uNXsFcyHF5KBAb --rpc $RPC_URL --keypair $KEYPAIR_PATH quote-unstake-lst  vSoLxydx6akxyMD9XEcPvGYNGq6Nn66oqVb3UkGkei7 10000000
+```
+
+### Unstake 0.01 vSOL from the main pool
+
+```
+liquid-unstaker-client-cli --pool 9nyw5jxhzuSs88HxKJyDCsWBZMhxj2uNXsFcyHF5KBAb --rpc $RPC_URL --keypair $KEYPAIR_PATH unstake-lst  vSoLxydx6akxyMD9XEcPvGYNGq6Nn66oqVb3UkGkei7 10000000
+```
