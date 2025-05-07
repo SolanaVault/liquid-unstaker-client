@@ -58,6 +58,7 @@ async fn main() -> anyhow::Result<()> {
                     Arg::new("tokens")
                         .help("Amount of LP tokens to deposit in order to withdraw corresponding lamports from the pool")
                         .required(true)
+                        .value_parser(clap::value_parser!(u64))
                 ),
         )
         .subcommand(
@@ -232,47 +233,95 @@ async fn main() -> anyhow::Result<()> {
                 &signers, recent_blockhash);
 
             // Send or simulate the transaction
-            if simulate {
-                let result = program.async_rpc().simulate_transaction(&tx).await?;
+            send_or_simulate_transaction(
+                &program.async_rpc(),
+                &tx,
+                simulate,
+            ).await?;
 
-                if result.value.err.is_some() {
-                    println!("Simulation failed: {:#?}", result.value);
-                } else {
-                    println!("Simulation success");
-                }
-
-            } else {
-                let result = program.async_rpc().send_and_confirm_transaction(&tx).await;
-
-                match result {
-                    Err(err) => {
-                        println!("Transaction failed: {:#?}", err);
-                    }
-                    Ok(signature) => {
-                        println!("Signature: {:?}", signature);
-                    }
-                }
-            }
         }
-        Some(("deposit", _arg_matches)) => {
+        Some(("deposit", arg_matches)) => {
 
             // Get ATA for the LP token of the unstake pool
-            let _user_unstake_pool_lp_ata = associated_token::get_associated_token_address(
+            let user_unstake_pool_lp_ata = associated_token::get_associated_token_address(
+                &wallet_keypair.pubkey(),
+                &unstake_pool_info.lp_mint,
+            );
+            
+            let lamports = *arg_matches.get_one::<u64>("lamports").unwrap();
+
+            let instructions = program.request()
+            .accounts(liquid_unstaker::liquid_unstaker::client::accounts::DepositSol {
+                pool: pool_id,
+                sol_vault: unstake_pool_info.sol_vault,
+                token_program: spl_token::id(),
+                system_program: solana_sdk::system_program::id(), 
+                lp_mint: unstake_pool_info.lp_mint, 
+                user: wallet_keypair.pubkey(), 
+                user_lp_account: user_unstake_pool_lp_ata, 
+                associated_token_program: associated_token::ID
+            })
+            .args(liquid_unstaker::liquid_unstaker::client::args::DepositSol {
+                amount: lamports,
+            })
+            .instructions()?;
+
+            // Build transaction
+            let recent_blockhash = program.async_rpc().get_latest_blockhash().await?;
+
+            let tx = Transaction::new_signed_with_payer(
+                &instructions,
+                Some(&wallet_keypair.pubkey()),
+                &[&wallet_keypair], 
+                recent_blockhash);        
+
+            // Send or simulate the transaction
+            send_or_simulate_transaction(
+                &program.async_rpc(),
+                &tx,
+                simulate,
+            ).await?;
+        }
+        Some(("withdraw", arg_matches)) => {
+
+            // Get ATA for the LP token of the unstake pool
+            let user_unstake_pool_lp_ata = associated_token::get_associated_token_address(
                 &wallet_keypair.pubkey(),
                 &unstake_pool_info.lp_mint,
             );
 
-            todo!()
-        }
-        Some(("withdraw", _arg_matches)) => {
+            let tokens = *arg_matches.get_one::<u64>("tokens").unwrap();
 
-            // Get ATA for the LP token of the unstake pool
-            let _user_unstake_pool_lp_ata = associated_token::get_associated_token_address(
-                &wallet_keypair.pubkey(),
-                &unstake_pool_info.lp_mint,
-            );
+            let instructions = program.request()
+            .accounts(liquid_unstaker::liquid_unstaker::client::accounts::WithdrawSol {
+                pool: pool_id,
+                sol_vault: unstake_pool_info.sol_vault,
+                token_program: spl_token::id(),
+                system_program: solana_sdk::system_program::id(), 
+                lp_mint: unstake_pool_info.lp_mint, 
+                user: wallet_keypair.pubkey(), 
+                user_lp_account: user_unstake_pool_lp_ata, 
+            })
+            .args(liquid_unstaker::liquid_unstaker::client::args::WithdrawSol {
+                lp_tokens: tokens,
+            })
+            .instructions()?;
 
-            todo!()
+            // Build transaction
+            let recent_blockhash = program.async_rpc().get_latest_blockhash().await?;
+
+            let tx = Transaction::new_signed_with_payer(
+                &instructions,
+                Some(&wallet_keypair.pubkey()),
+                &[&wallet_keypair], 
+                recent_blockhash);        
+
+            // Send or simulate the transaction
+            send_or_simulate_transaction(
+                &program.async_rpc(),
+                &tx,
+                simulate,
+            ).await?;
         }
         _ => {
             println!("No valid subcommand was provided");
@@ -282,6 +331,35 @@ async fn main() -> anyhow::Result<()> {
 
     Ok(())
 
+}
+
+async fn send_or_simulate_transaction(
+    rpc: &RpcClient,
+    tx: &Transaction,
+    simulate: bool,
+) -> anyhow::Result<()> {
+    if simulate {
+        let result = rpc.simulate_transaction(tx).await?;
+
+        if result.value.err.is_some() {
+            println!("Simulation failed: {:#?}", result.value);
+        } else {
+            println!("Simulation success");
+        }
+
+    } else {
+        let result = rpc.send_and_confirm_transaction(tx).await;
+
+        match result {
+            Err(err) => {
+                println!("Transaction failed: {:#?}", err);
+            }
+            Ok(signature) => {
+                println!("Signature: {:?}", signature);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Function to get the SPL Stake Pool info for the given pool (LST) mint, uses the GetProgramAccounts RPC call
@@ -403,9 +481,6 @@ fn get_unstake_accounts(
 
             let active_stake_lamports: u64 = Into::<u64>::into(validator_info.active_stake_lamports);
 
-            /*println!("LiquidUnstakeAmm::get_swap_and_account_metas validator_info {:?} lamports {:?}", 
-                validator_info.vote_account_address, active_stake_lamports);*/
-
             AccountInfo {
                 is_preferred,
                 stake_address: stake_account_address,
@@ -416,8 +491,6 @@ fn get_unstake_accounts(
 
     // Prepare the list of accounts to withdraw from
     let mut remaining_amount = amount_in;
-
-    //println!("LiquidUnstakeAmm::get_swap_and_account_metas: remaining_amount: {}", remaining_amount);
 
     let fee = &stake_pool_state.stake_withdrawal_fee;
     let inverse_fee_numerator = fee.denominator - fee.numerator;
@@ -446,15 +519,11 @@ fn get_unstake_accounts(
 
             let mut available_for_withdrawal = calc_pool_tokens_for_deposit(account.lamports);
     
-            /*println!("LiquidUnstakeAmm::get_swap_and_account_metas: stake_account {:?} available_for_withdrawal {}", 
-                account.stake_address, available_for_withdrawal);*/
-
             if inverse_fee_numerator != 0 {
                 available_for_withdrawal = available_for_withdrawal
                     .mul(inverse_fee_denominator as u128)
                     .div(inverse_fee_numerator as u128);
                 
-                //println!("LiquidUnstakeAmm::get_swap_and_account_metas: inverse_fee {:?}/{:?} available_for_withdrawal {}", inverse_fee_numerator, inverse_fee_denominator, available_for_withdrawal);
             }
     
             let pool_amount = (available_for_withdrawal as u64).min(remaining_amount);
@@ -463,17 +532,11 @@ fn get_unstake_accounts(
                 continue;
             }
 
-            //println!("LiquidUnstakeAmm::get_swap_and_account_metas: adding stake account {:?} with lamports {} pool_amount {} is_preferred {}", 
-            //    account.stake_address, account.lamports, pool_amount, account.is_preferred);
-    
-            // Those accounts will be withdrawn completely with `claim` instruction
             withdraw_from.push(account.clone());
             lst_amounts.push(pool_amount);
 
             remaining_amount -= pool_amount;
 
-            //println!("LiquidUnstakeAmm::get_swap_and_account_metas: updated remaining_amount {}", remaining_amount);
-    
             if remaining_amount == 0 {
                 break;
             }
