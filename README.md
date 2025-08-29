@@ -6,6 +6,7 @@ Available commands in the CLI
 - unstake-lst, perform a liquid unstake of an SPL LST, e.g. jitoSOL, vSOL, bSOL. Eseentially send LST amount and and receive naked SOL back. Conversion rate is determined by the SPL stake pool
 - deposit SOL, deposit SOL into the pool and receive LP tokens back
 - withdraw SOL, withdraw SOL from the pool by depositing LP tokens and get the deposited SOL back + fees from unstakes since the deposit was made
+- list-lst-mints, list all LST mints that are supported for unstaking (essentially enumerating all supported SPL or SPL derived stake pools and get the mint)
 - unstake-stake (TODO)
 
 ## Pool ids
