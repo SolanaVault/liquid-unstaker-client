@@ -13,11 +13,12 @@ incremental = false
 codegen-units = 1
 
 [workspace.dependencies]
-anchor-client = "0.30.1"
-anchor-lang = "0.30.1"
-anchor-spl = "0.30.1"
+anchor-client = "0.31.1"
+anchor-lang = "0.31.1"
+anchor-spl = "0.31.1"
+solana-sdk = "2"
 clap = "4.5.37"
 anyhow = "1.0.98"
-spl-stake-pool = { version = "1.0.0", features = ["no-entrypoint"] }
+spl-stake-pool = { version = "2.0.0", features = ["no-entrypoint"] }
 itertools = "0.14.0"
-solana-account-decoder = "^1.17.3"
+solana-account-decoder = "2"

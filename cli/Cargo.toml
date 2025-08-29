@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 clap.workspace = true
 anchor-client = { workspace = true, features = ["async"]}
+anchor-lang = { workspace = true }
 anchor-spl = { workspace = true }
 liquid-unstaker = { path = "../programs/liquid-unstaker" }
 tokio = "^1.40"
