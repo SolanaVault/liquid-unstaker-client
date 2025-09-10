@@ -5,7 +5,7 @@ use std::{
 use anchor_client::{
     solana_client::{
         nonblocking::rpc_client::RpcClient,
-        rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig},
+        rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig, RpcSimulateTransactionAccountsConfig, RpcSimulateTransactionConfig},
         rpc_filter::{Memcmp, RpcFilterType},
     },
     solana_sdk::{
@@ -26,7 +26,7 @@ use anchor_spl::{
 use anyhow::Result;
 use clap::{Arg, Command};
 use fee::{Fee, FEE_PCT_BPS};
-use itertools::Itertools;
+use itertools::{izip, Itertools};
 use solana_account_decoder::UiAccountEncoding;
 use spl_stake_pool::{
     find_stake_program_address,
@@ -188,7 +188,7 @@ async fn main() -> Result<()> {
                     quote_lst_unstake(&spl_stake_pool_state, &unstake_pool_info, in_amount)?;
 
                 println!(
-                    "Quote: {} lamports received for {} {:?} tokens",
+                    "Quote: {} lamports received for {} {:?} tokens (excluding transaction fees)",
                     quote, in_amount, mint
                 );
             } else {
@@ -265,7 +265,7 @@ async fn main() -> Result<()> {
             );
 
             // Send or simulate the transaction
-            send_or_simulate_transaction(&program.rpc(), &tx, simulate).await?;
+            send_or_simulate_transaction(&program.rpc(), &tx, simulate, None).await?;
         }
         Some(("withdraw", arg_matches)) => {
             // Get ATA for the LP token of the unstake pool
@@ -307,7 +307,7 @@ async fn main() -> Result<()> {
             );
 
             // Send or simulate the transaction
-            send_or_simulate_transaction(&program.rpc(), &tx, simulate).await?;
+            send_or_simulate_transaction(&program.rpc(), &tx, simulate, None).await?;
         }
         Some(("list-lst-mints", arg_matches)) => {
             let limit = *arg_matches.get_one::<u64>("limit").unwrap_or(&u64::MAX);
@@ -466,7 +466,13 @@ async fn unstake_lst(
     );
 
     // Send or simulate the transaction
-    send_or_simulate_transaction(&program.rpc(), &tx, simulate).await?;
+    send_or_simulate_transaction(&program.rpc(), &tx, simulate, 
+        Some(vec![
+            wallet_keypair.pubkey(), 
+            unstake_pool_info.sol_vault,
+            unstake_pool_info.manager_fee_account,
+            new_stake_accounts[0].pubkey(),
+        ])).await?;
 
     Ok(())
 }
@@ -516,14 +522,50 @@ async fn send_or_simulate_transaction(
     rpc: &RpcClient,
     tx: &Transaction,
     simulate: bool,
+    simulation_accounts_of_interest: Option<Vec<Pubkey>>,
 ) -> Result<()> {
     if simulate {
-        let result = rpc.simulate_transaction(tx).await?;
+
+        let simulation_accounts_of_interest = simulation_accounts_of_interest.unwrap_or(vec![]);
+
+        let mut pre_simulation_accounts_of_interest_balances = vec![];
+        
+        for account in simulation_accounts_of_interest.iter() {
+
+            let pre_balance = rpc.get_account(&account).await.ok().map(|a| a.lamports).unwrap_or(0);
+            pre_simulation_accounts_of_interest_balances.push((account, pre_balance));
+        }
+
+        let result = rpc.simulate_transaction_with_config(
+            tx,
+            RpcSimulateTransactionConfig {
+                accounts: Some(RpcSimulateTransactionAccountsConfig {
+                    addresses: simulation_accounts_of_interest.iter().map(|p| p.to_string()).collect_vec(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await?;
 
         if result.value.err.is_some() {
             println!("Simulation failed: {:#?}", result.value);
         } else {
             println!("Simulation success");
+
+            if let Some(accounts) = result.value.accounts {
+                for ((account_key, account_pre_simulation), account_post_simulation) in izip!(pre_simulation_accounts_of_interest_balances, accounts) {
+                    if let Some(account_post_simulation) = account_post_simulation {
+                        println!("Account {} lamports {} -> {} diff {}", 
+                            account_key, 
+                            account_pre_simulation, 
+                            account_post_simulation.lamports,
+                            (account_post_simulation.lamports as i64) - (account_pre_simulation as i64)
+                        );
+                    }
+                }
+
+            }
+
         }
     } else {
         let result = rpc.send_and_confirm_transaction(tx).await;
@@ -588,25 +630,23 @@ async fn get_stake_pool_for_lst_mint(
 pub fn quote_lst_unstake(
     stake_pool_state: &StakePool,
     liquid_unstake_pool_state: &liquid_unstaker::liquid_unstaker::accounts::Pool,
-    in_amount: u64,
-) -> Result<u64> {
+    pool_tokens: u64,
+) -> Result<i64> {
     let pool_tokens_fee = stake_pool_state
-        .stake_withdrawal_fee
-        .apply(in_amount)
+        .calc_pool_tokens_stake_withdrawal_fee(pool_tokens)
         .unwrap() as u64;
-    let pool_tokens_burnt = in_amount - pool_tokens_fee;
+    let pool_tokens_net = pool_tokens - pool_tokens_fee;
     let total_amount_to_unstake = stake_pool_state
-        .calc_lamports_withdraw_amount(pool_tokens_burnt)
+        .calc_lamports_withdraw_amount(pool_tokens_net)
         .unwrap();
 
-    // We also get the rent for the stake account
-    let total_amount_to_unstake = total_amount_to_unstake
-        + solana_sdk::rent::Rent::default()
-            .minimum_balance(solana_sdk::stake::state::StakeStateV2::size_of());
+    // Since we create the stake account and pay rent for it, the unstake program will give it back to us
+    let stake_account_rent = solana_sdk::rent::Rent::default().minimum_balance(
+        size_of::<solana_sdk::stake::state::StakeStateV2>(),
+    );
+    
+    let total_amount_to_unstake = total_amount_to_unstake + stake_account_rent;
 
-    if total_amount_to_unstake > liquid_unstake_pool_state.sol_vault_lamports {
-        return Err(anyhow::anyhow!("Not enough SOL in the vault"));
-    }
 
     // Fee is determined by the liquid unstake pool parameters
     let base_fee_pct_bps = Fee::calculate_base_fee(
@@ -632,7 +672,7 @@ pub fn quote_lst_unstake(
         size_of::<liquid_unstaker::liquid_unstaker::accounts::StakeAccountInfo>() + 8,
     );
 
-    let amount_out = total_amount_to_unstake - fee_amount - pda_rent;
+    let amount_out = total_amount_to_unstake as i64 - fee_amount as i64 - pda_rent as i64 - stake_account_rent as i64;
 
     return Ok(amount_out);
 }
