@@ -9,12 +9,7 @@ use anchor_client::{
         rpc_filter::{Memcmp, RpcFilterType},
     },
     solana_sdk::{
-        self,
-        pubkey::Pubkey,
-        signature::{read_keypair_file, Keypair},
-        signer::Signer,
-        system_instruction::create_account,
-        transaction::Transaction,
+        self, pubkey::Pubkey, signature::{read_keypair_file, Keypair}, signer::Signer, system_instruction::create_account, transaction::Transaction
     },
     Client,
 };
@@ -111,7 +106,37 @@ async fn main() -> Result<()> {
                 ),
         )
         .subcommand(
+            Command::new("unstake-lst-wrapped")
+                .about("Unstake the LST from the pool and receive WSOL back (V2 only)")
+                .arg(
+                    Arg::new("mint")
+                        .help("Mint of the LST token")
+                        .required(true)
+                )
+                .arg(
+                    Arg::new("amount")
+                        .help("Amount of LP tokens to deposit in order to withdraw corresponding lamports from the pool")
+                        .required(true)
+                        .value_parser(clap::value_parser!(u64))
+                ),
+        )
+        .subcommand(
             Command::new("quote-unstake-lst")
+                .about("Get a quote of how many lamports would be received by unstaking the given amount of LST tokens (V2 only)")
+                .arg(
+                    Arg::new("mint")
+                        .help("Mint of the LST token")
+                        .required(true)
+                )
+                .arg(
+                    Arg::new("amount")
+                        .help("Amount of LP tokens to deposit in order to withdraw corresponding lamports from the pool")
+                        .required(true)
+                        .value_parser(clap::value_parser!(u64))
+                ),
+        )
+        .subcommand(
+            Command::new("quote-unstake-lst-wrapped")
                 .about("Get a quote of how many lamports would be received by unstaking the given amount of LST tokens")
                 .arg(
                     Arg::new("mint")
@@ -134,6 +159,10 @@ async fn main() -> Result<()> {
                         .required(false)
                         .value_parser(clap::value_parser!(u64))
                 )
+        )
+        .subcommand(
+            Command::new("pool-info")
+                .about("Get information about the unstake pool")
         )
         .get_matches();
 
@@ -197,6 +226,34 @@ async fn main() -> Result<()> {
                 ));
             }
         }
+        Some(("quote-unstake-lst-wrapped", arg_matches)) => {
+            let rpc = program.rpc();
+            let mint: Pubkey =
+                Pubkey::from_str(arg_matches.get_one::<String>("mint").unwrap()).unwrap();
+
+            // Make sure to get the right stake pool program id for this mint
+            let spl_stake_pool_program_id =
+                get_stake_pool_program_for_lst_mint(&rpc, &mint).await?;
+
+            if let Some(spl_stake_pool_program_id) = spl_stake_pool_program_id {
+                let (_, spl_stake_pool_state) =
+                    get_stake_pool_for_lst_mint(&rpc, &mint, &spl_stake_pool_program_id).await?;
+
+                let in_amount = *arg_matches.get_one::<u64>("amount").unwrap();
+
+                let (quote_wsol, fees) =
+                    quote_lst_unstake_wrapped(&spl_stake_pool_state, &unstake_pool_info, in_amount)?;
+
+                println!(
+                    "Quote: {} wsol and {} lamports received for {} {:?} tokens",
+                    quote_wsol, fees, in_amount, mint
+                );
+            } else {
+                return Err(anyhow::anyhow!(
+                    "Could not find a supported stake pool for the given mint"
+                ));
+            }
+        }
         Some(("unstake-lst", arg_matches)) => {
             let rpc = program.rpc();
             let mint: Pubkey =
@@ -206,10 +263,43 @@ async fn main() -> Result<()> {
             let spl_stake_pool_program_id =
                 get_stake_pool_program_for_lst_mint(&rpc, &mint).await?;
 
+            println!("SPL Stake Pool Program ID: {:?}", spl_stake_pool_program_id);
+
             let amount = arg_matches.get_one::<u64>("amount").unwrap();
 
             if let Some(spl_stake_pool_program_id) = spl_stake_pool_program_id {
                 unstake_lst(
+                    &program,
+                    &unstake_pool_id,
+                    &wallet_keypair,
+                    &spl_stake_pool_program_id,
+                    &mint,
+                    &unstake_pool_info,
+                    *amount,
+                    simulate,
+                )
+                .await?;
+            } else {
+                return Err(anyhow::anyhow!(
+                    "Could not find a supported stake pool for the given mint"
+                ));
+            }
+        }
+        Some(("unstake-lst-wrapped", arg_matches)) => {
+            let rpc = program.rpc();
+            let mint: Pubkey =
+                Pubkey::from_str(arg_matches.get_one::<String>("mint").unwrap()).unwrap();
+
+            // Make sure to get the right stake pool program id for this mint
+            let spl_stake_pool_program_id =
+                get_stake_pool_program_for_lst_mint(&rpc, &mint).await?;
+
+            println!("SPL Stake Pool Program ID: {:?}", spl_stake_pool_program_id);
+
+            let amount = arg_matches.get_one::<u64>("amount").unwrap();
+
+            if let Some(spl_stake_pool_program_id) = spl_stake_pool_program_id {
+                unstake_lst_wrapped(
                     &program,
                     &unstake_pool_id,
                     &wallet_keypair,
@@ -325,6 +415,12 @@ async fn main() -> Result<()> {
                 .into_iter()
                 .take(limit as usize)
                 .for_each(|mint| println!("{:?}", mint));
+        }
+        Some(("pool-info", arg_matches)) => {
+
+            let rpc = program.rpc();
+
+            println!("{:#?}", unstake_pool_info);
         }
         _ => {
             println!("No valid subcommand was provided");
@@ -469,6 +565,153 @@ async fn unstake_lst(
     send_or_simulate_transaction(&program.rpc(), &tx, simulate, 
         Some(vec![
             wallet_keypair.pubkey(), 
+            unstake_pool_info.sol_vault,
+            unstake_pool_info.manager_fee_account,
+            new_stake_accounts[0].pubkey(),
+        ])).await?;
+
+    Ok(())
+}
+
+async fn unstake_lst_wrapped(
+    program: &anchor_client::Program<Rc<Keypair>>,
+    unstake_pool_id: &Pubkey,
+    wallet_keypair: &Keypair,
+    spl_stake_pool_program_id: &Pubkey,
+    mint: &Pubkey,
+    unstake_pool_info: &liquid_unstaker::liquid_unstaker::accounts::Pool,
+    amount: u64,
+    simulate: bool,
+) -> Result<()> {
+    let rpc = program.rpc();
+
+    let (spl_stake_pool_address, spl_stake_pool_state) =
+        get_stake_pool_for_lst_mint(&rpc, &mint, &spl_stake_pool_program_id).await?;
+
+    assert_eq!(spl_stake_pool_state.pool_mint, *mint);
+
+    let spl_stake_pool_validator_list = rpc
+        .get_account(&spl_stake_pool_state.validator_list)
+        .await
+        .map(|account| {
+            let mut data = account.data.as_slice();
+            spl_stake_pool::state::ValidatorList::deserialize(&mut data)
+        })??;
+
+    // Get all the accounts we need for liquid unstaking, and calculate amounts to pass to the liquid unstake instruction
+
+    let (lst_amounts, withdraw_stake_accounts, new_stake_accounts, new_stake_pda_accounts) =
+        get_unstake_accounts(
+            &spl_stake_pool_program_id,
+            &spl_stake_pool_address,
+            &spl_stake_pool_state,
+            &spl_stake_pool_validator_list,
+            amount,
+        )?;
+
+    let lst_amounts = lst_amounts
+        .into_iter()
+        .pad_using(5, |_| 0)
+        .collect_array::<5>()
+        .unwrap();
+
+    let wallet_lst_token_ata = associated_token::get_associated_token_address(
+        &wallet_keypair.pubkey(),
+        &spl_stake_pool_state.pool_mint,
+    );
+
+    let wallet_wsol_token_ata = associated_token::get_associated_token_address(
+        &wallet_keypair.pubkey(),
+        &spl_token::native_mint::id(),
+    );
+
+    let stake_pool_withdraw_authority = Pubkey::find_program_address(
+        &[&spl_stake_pool_address.to_bytes(), b"withdraw"],
+        &spl_stake_pool_program_id,
+    )
+    .0;
+
+    let instructions = program
+        .request()
+        .accounts(
+            liquid_unstaker::liquid_unstaker::client::accounts::LiquidUnstakeLstWithWrapped {
+                pool: *unstake_pool_id,
+                sol_vault: unstake_pool_info.sol_vault,
+                token_program: spl_token::id(),
+                payer: wallet_keypair.pubkey(),
+                user_transfer_authority: wallet_keypair.pubkey(),
+                user_lst_account: wallet_lst_token_ata,
+                user_sol_account: wallet_wsol_token_ata,
+                manager_fee_account: unstake_pool_info.manager_fee_account,
+                stake_pool: spl_stake_pool_address,
+                stake_pool_validator_list: spl_stake_pool_state.validator_list,
+                stake_pool_withdraw_authority: stake_pool_withdraw_authority,
+                stake_pool_manager_fee_account: spl_stake_pool_state.manager_fee_account,
+                stake_pool_mint: spl_stake_pool_state.pool_mint,
+                stake_program: solana_sdk::stake::program::id(),
+                stake_pool_program: *spl_stake_pool_program_id,
+                system_program: solana_sdk::system_program::id(),
+                clock: solana_sdk::sysvar::clock::id(),
+            },
+        )
+        .accounts(vec![
+            withdraw_stake_accounts
+                .into_iter()
+                .map(|x| AccountMeta::new(x, false))
+                .collect_vec(),
+            new_stake_accounts
+                .iter()
+                .map(|x| AccountMeta::new(x.pubkey(), true))
+                .collect_vec(),
+            new_stake_pda_accounts
+                .into_iter()
+                .map(|x| AccountMeta::new(x, false))
+                .collect_vec(),
+        ])
+        .args(
+            liquid_unstaker::liquid_unstaker::client::args::LiquidUnstakeLstWithWrapped {
+                lst_amounts,
+                minimum_lamports_out: None,
+            },
+        )
+        .instructions()?;
+
+    // We need to create the new stake accounts before we can send the transaction
+    let create_instructions = new_stake_accounts
+        .iter()
+        .map(|stake_account_keypair| {
+            create_account(
+                &wallet_keypair.pubkey(),
+                &stake_account_keypair.pubkey(),
+                solana_sdk::rent::Rent::default()
+                    .minimum_balance(solana_sdk::stake::state::StakeStateV2::size_of()),
+                solana_sdk::stake::state::StakeStateV2::size_of() as u64,
+                &solana_sdk::stake::program::id(),
+            )
+        })
+        .collect_vec();
+
+    // Build transaction
+    let recent_blockhash = rpc.get_latest_blockhash().await?;
+
+    let signers = [
+        vec![wallet_keypair],
+        new_stake_accounts.iter().collect_vec(),
+    ]
+    .concat();
+
+    let tx = Transaction::new_signed_with_payer(
+        &[create_instructions, instructions].concat(),
+        Some(&wallet_keypair.pubkey()),
+        &signers,
+        recent_blockhash,
+    );
+
+    // Send or simulate the transaction
+    send_or_simulate_transaction(&program.rpc(), &tx, simulate, 
+        Some(vec![
+            wallet_keypair.pubkey(), 
+            wallet_wsol_token_ata,
             unstake_pool_info.sol_vault,
             unstake_pool_info.manager_fee_account,
             new_stake_accounts[0].pubkey(),
@@ -648,6 +891,12 @@ pub fn quote_lst_unstake(
     let total_amount_to_unstake = total_amount_to_unstake + stake_account_rent;
 
 
+    if total_amount_to_unstake > liquid_unstake_pool_state.sol_vault_lamports {
+        return Err(anyhow::anyhow!(
+            "Not enough liquidity in the unstake pool to cover this unstake amount"
+        ));
+    }
+
     // Fee is determined by the liquid unstake pool parameters
     let base_fee_pct_bps = Fee::calculate_base_fee(
         &liquid_unstake_pool_state,
@@ -675,6 +924,59 @@ pub fn quote_lst_unstake(
     let amount_out = total_amount_to_unstake as i64 - fee_amount as i64 - pda_rent as i64 - stake_account_rent as i64;
 
     return Ok(amount_out);
+}
+
+
+/// Function to get the amount of lamports that would be received by unstaking the given amount of LST tokens
+pub fn quote_lst_unstake_wrapped(
+    stake_pool_state: &StakePool,
+    liquid_unstake_pool_state: &liquid_unstaker::liquid_unstaker::accounts::Pool,
+    pool_tokens: u64,
+) -> Result<(i64, i64)> {
+    let pool_tokens_fee = stake_pool_state
+        .calc_pool_tokens_stake_withdrawal_fee(pool_tokens)
+        .unwrap() as u64;
+    let pool_tokens_net = pool_tokens - pool_tokens_fee;
+    let total_amount_to_unstake = stake_pool_state
+        .calc_lamports_withdraw_amount(pool_tokens_net)
+        .unwrap();
+
+    // Since we create the stake account and pay rent for it, the unstake program will give it back to us
+    let stake_account_rent = solana_sdk::rent::Rent::default().minimum_balance(
+        size_of::<solana_sdk::stake::state::StakeStateV2>(),
+    );
+    
+    let total_amount_to_unstake = total_amount_to_unstake + stake_account_rent;
+
+    if total_amount_to_unstake > liquid_unstake_pool_state.sol_vault_lamports {
+        return Err(anyhow::anyhow!(
+            "Not enough liquidity in the unstake pool to cover this unstake amount"
+        ));
+    }
+
+    // Fee is determined by the liquid unstake pool parameters
+    let base_fee_pct_bps = Fee::calculate_base_fee(
+        &liquid_unstake_pool_state,
+        liquid_unstake_pool_state.sol_vault_lamports,
+        total_amount_to_unstake,
+    )? as u128;
+
+    let fee = Fee {
+        base_fee: base_fee_pct_bps
+            .mul(total_amount_to_unstake as u128)
+            .div(FEE_PCT_BPS as u128) as u64,
+        manager_fee: base_fee_pct_bps
+            .mul(total_amount_to_unstake as u128)
+            .mul(liquid_unstake_pool_state.manager_fee_pct as u128)
+            .div(100 as u128 * FEE_PCT_BPS as u128) as u64,
+    };
+
+    let fee_amount = fee.total_fee();
+
+    let wsol_amount_out = total_amount_to_unstake as i64 - fee_amount as i64;
+    let lamports_amount_out = -(stake_account_rent as i64);
+
+    return Ok((wsol_amount_out, lamports_amount_out));
 }
 
 fn get_unstake_accounts(
