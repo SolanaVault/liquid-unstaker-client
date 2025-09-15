@@ -631,7 +631,7 @@ async fn unstake_lst_wrapped(
     )
     .0;
 
-    let instructions = program
+    let mut instructions = program
         .request()
         .accounts(
             liquid_unstaker::liquid_unstaker::client::accounts::LiquidUnstakeLstWithWrapped {
@@ -676,6 +676,9 @@ async fn unstake_lst_wrapped(
         )
         .instructions()?;
 
+    instructions.insert(0, solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(1_000_000));
+
+    /*
     // We need to create the new stake accounts before we can send the transaction
     let create_instructions = new_stake_accounts
         .iter()
@@ -690,6 +693,7 @@ async fn unstake_lst_wrapped(
             )
         })
         .collect_vec();
+    */
 
     // Build transaction
     let recent_blockhash = rpc.get_latest_blockhash().await?;
@@ -701,7 +705,7 @@ async fn unstake_lst_wrapped(
     .concat();
 
     let tx = Transaction::new_signed_with_payer(
-        &[create_instructions, instructions].concat(),
+        &instructions,
         Some(&wallet_keypair.pubkey()),
         &signers,
         recent_blockhash,
@@ -941,7 +945,8 @@ pub fn quote_lst_unstake_wrapped(
         .calc_lamports_withdraw_amount(pool_tokens_net)
         .unwrap();
 
-    // Since we create the stake account and pay rent for it, the unstake program will give it back to us
+    // The program will pay rent for a stake account which is included in the fee calculation but
+    // deduced from the wsol amount returned to the user
     let stake_account_rent = solana_sdk::rent::Rent::default().minimum_balance(
         size_of::<solana_sdk::stake::state::StakeStateV2>(),
     );
@@ -973,8 +978,8 @@ pub fn quote_lst_unstake_wrapped(
 
     let fee_amount = fee.total_fee();
 
-    let wsol_amount_out = total_amount_to_unstake as i64 - fee_amount as i64;
-    let lamports_amount_out = -(stake_account_rent as i64);
+    let wsol_amount_out = total_amount_to_unstake as i64 - fee_amount as i64 - stake_account_rent as i64;
+    let lamports_amount_out = 0;
 
     return Ok((wsol_amount_out, lamports_amount_out));
 }
@@ -1081,6 +1086,10 @@ fn get_unstake_accounts(
     if remaining_amount > 0 {
         return Err(anyhow::anyhow!("Not enough pool tokens to unstake"));
     }
+
+    withdraw_from.iter().for_each(|account| {
+        println!("Withdrawing from stake account {:?} that has {} lamports", account.stake_address, account.lamports);
+    });
 
     let withdraw_stake_accounts = withdraw_from
         .iter()
