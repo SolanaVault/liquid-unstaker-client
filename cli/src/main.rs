@@ -20,7 +20,7 @@ use anchor_spl::{
 };
 use anyhow::Result;
 use clap::{Arg, Command};
-use fee::{Fee, FEE_PCT_BPS};
+use fee::{Fee, FEE_PCT_DIVISOR};
 use itertools::{izip, Itertools};
 use solana_account_decoder::UiAccountEncoding;
 use spl_stake_pool::{
@@ -29,6 +29,7 @@ use spl_stake_pool::{
 };
 
 mod fee;
+mod error;
 
 const SANCTUM_SINGLE_VALIDATOR_STAKE_POOL_PROGRAM: Pubkey =
     pubkey!("SP12tWFxD9oJsVWNavTTBZvMbA6gkAmxtVgxdqvyvhY");
@@ -416,9 +417,7 @@ async fn main() -> Result<()> {
                 .take(limit as usize)
                 .for_each(|mint| println!("{:?}", mint));
         }
-        Some(("pool-info", arg_matches)) => {
-
-            let rpc = program.rpc();
+        Some(("pool-info", _arg_matches)) => {
 
             println!("{:#?}", unstake_pool_info);
         }
@@ -911,21 +910,16 @@ pub fn quote_lst_unstake(
     let fee = Fee {
         base_fee: base_fee_pct_bps
             .mul(total_amount_to_unstake as u128)
-            .div(FEE_PCT_BPS as u128) as u64,
+            .div(FEE_PCT_DIVISOR as u128) as u64,
         manager_fee: base_fee_pct_bps
             .mul(total_amount_to_unstake as u128)
             .mul(liquid_unstake_pool_state.manager_fee_pct as u128)
-            .div(100 as u128 * FEE_PCT_BPS as u128) as u64,
+            .div(100 as u128 * FEE_PCT_DIVISOR as u128) as u64,
     };
 
     let fee_amount = fee.total_fee();
 
-    // When swapping, the liquid unstaker also creates a PDA account, which will cost some rent
-    let pda_rent = solana_sdk::rent::Rent::default().minimum_balance(
-        size_of::<liquid_unstaker::liquid_unstaker::accounts::StakeAccountInfo>() + 8,
-    );
-
-    let amount_out = total_amount_to_unstake as i64 - fee_amount as i64 - pda_rent as i64 - stake_account_rent as i64;
+    let amount_out = total_amount_to_unstake as i64 - fee_amount as i64 - stake_account_rent as i64;
 
     return Ok(amount_out);
 }
@@ -969,11 +963,11 @@ pub fn quote_lst_unstake_wrapped(
     let fee = Fee {
         base_fee: base_fee_pct_bps
             .mul(total_amount_to_unstake as u128)
-            .div(FEE_PCT_BPS as u128) as u64,
+            .div(FEE_PCT_DIVISOR as u128) as u64,
         manager_fee: base_fee_pct_bps
             .mul(total_amount_to_unstake as u128)
             .mul(liquid_unstake_pool_state.manager_fee_pct as u128)
-            .div(100 as u128 * FEE_PCT_BPS as u128) as u64,
+            .div(100 as u128 * FEE_PCT_DIVISOR as u128) as u64,
     };
 
     let fee_amount = fee.total_fee();

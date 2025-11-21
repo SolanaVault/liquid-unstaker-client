@@ -121,6 +121,96 @@
       ]
     },
     {
+      "name": "flash_borrow",
+      "discriminator": [
+        166,
+        221,
+        220,
+        25,
+        61,
+        73,
+        127,
+        240
+      ],
+      "accounts": [
+        {
+          "name": "pool",
+          "writable": true
+        },
+        {
+          "name": "sol_vault",
+          "writable": true
+        },
+        {
+          "name": "borrower",
+          "docs": [
+            "The borrower's account that will receive the flash loan (must sign)"
+          ],
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "instructions"
+        },
+        {
+          "name": "system_program"
+        }
+      ],
+      "args": [
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "flash_repay",
+      "discriminator": [
+        182,
+        143,
+        19,
+        23,
+        39,
+        221,
+        184,
+        78
+      ],
+      "accounts": [
+        {
+          "name": "pool",
+          "writable": true
+        },
+        {
+          "name": "sol_vault",
+          "writable": true
+        },
+        {
+          "name": "borrower",
+          "docs": [
+            "The borrower's account that must repay the flash loan"
+          ],
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "manager_fee_account",
+          "writable": true
+        },
+        {
+          "name": "instructions"
+        },
+        {
+          "name": "system_program"
+        }
+      ],
+      "args": [
+        {
+          "name": "repay_amount",
+          "type": "u64"
+        }
+      ]
+    },
+    {
       "name": "initialize_pool",
       "discriminator": [
         95,
@@ -183,6 +273,22 @@
         {
           "name": "vault_lamports_cap",
           "type": "u64"
+        },
+        {
+          "name": "withdraw_sol_fee",
+          "type": "u16"
+        },
+        {
+          "name": "withdraw_stake_account_fee",
+          "type": "u16"
+        },
+        {
+          "name": "flash_loans_enabled",
+          "type": "bool"
+        },
+        {
+          "name": "flash_loan_fee",
+          "type": "u32"
         }
       ]
     },
@@ -285,6 +391,108 @@
       ]
     },
     {
+      "name": "liquid_unstake_lst_with_seed",
+      "discriminator": [
+        205,
+        199,
+        161,
+        101,
+        239,
+        109,
+        148,
+        163
+      ],
+      "accounts": [
+        {
+          "name": "pool",
+          "writable": true
+        },
+        {
+          "name": "payer",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "user_transfer_authority",
+          "signer": true
+        },
+        {
+          "name": "user_lst_account",
+          "writable": true
+        },
+        {
+          "name": "sol_vault",
+          "writable": true
+        },
+        {
+          "name": "user_sol_account",
+          "writable": true
+        },
+        {
+          "name": "manager_fee_account",
+          "writable": true
+        },
+        {
+          "name": "stake_pool",
+          "writable": true
+        },
+        {
+          "name": "stake_pool_validator_list",
+          "writable": true
+        },
+        {
+          "name": "stake_pool_withdraw_authority"
+        },
+        {
+          "name": "stake_pool_manager_fee_account",
+          "writable": true
+        },
+        {
+          "name": "stake_pool_mint",
+          "writable": true
+        },
+        {
+          "name": "token_program"
+        },
+        {
+          "name": "stake_program"
+        },
+        {
+          "name": "stake_pool_program"
+        },
+        {
+          "name": "system_program"
+        },
+        {
+          "name": "clock"
+        },
+        {
+          "name": "stake_history"
+        }
+      ],
+      "args": [
+        {
+          "name": "lst_amounts",
+          "type": {
+            "array": [
+              "u64",
+              5
+            ]
+          }
+        },
+        {
+          "name": "minimum_lamports_out",
+          "type": {
+            "option": "u64"
+          }
+        },
+        {
+          "name": "stake_account_seed",
+          "type": "u64"
+        }
+      ]
+    },
+    {
       "name": "liquid_unstake_lst_with_wrapped",
       "discriminator": [
         88,
@@ -376,6 +584,105 @@
           "type": {
             "option": "u64"
           }
+        }
+      ]
+    },
+    {
+      "name": "liquid_unstake_lst_with_wrapped_seed",
+      "discriminator": [
+        81,
+        151,
+        125,
+        105,
+        38,
+        28,
+        199,
+        104
+      ],
+      "accounts": [
+        {
+          "name": "pool",
+          "writable": true
+        },
+        {
+          "name": "payer",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "user_transfer_authority",
+          "signer": true
+        },
+        {
+          "name": "user_lst_account",
+          "writable": true
+        },
+        {
+          "name": "sol_vault",
+          "writable": true
+        },
+        {
+          "name": "user_sol_account",
+          "writable": true
+        },
+        {
+          "name": "manager_fee_account",
+          "writable": true
+        },
+        {
+          "name": "stake_pool",
+          "writable": true
+        },
+        {
+          "name": "stake_pool_validator_list",
+          "writable": true
+        },
+        {
+          "name": "stake_pool_withdraw_authority"
+        },
+        {
+          "name": "stake_pool_manager_fee_account",
+          "writable": true
+        },
+        {
+          "name": "stake_pool_mint",
+          "writable": true
+        },
+        {
+          "name": "token_program"
+        },
+        {
+          "name": "stake_program"
+        },
+        {
+          "name": "stake_pool_program"
+        },
+        {
+          "name": "system_program"
+        },
+        {
+          "name": "clock"
+        }
+      ],
+      "args": [
+        {
+          "name": "lst_amounts",
+          "type": {
+            "array": [
+              "u64",
+              5
+            ]
+          }
+        },
+        {
+          "name": "minimum_lamports_out",
+          "type": {
+            "option": "u64"
+          }
+        },
+        {
+          "name": "stake_account_seed",
+          "type": "u64"
         }
       ]
     },
@@ -536,6 +843,22 @@
         {
           "name": "vault_lamports_cap",
           "type": "u64"
+        },
+        {
+          "name": "withdraw_sol_fee",
+          "type": "u16"
+        },
+        {
+          "name": "withdraw_stake_account_fee",
+          "type": "u16"
+        },
+        {
+          "name": "flash_loans_enabled",
+          "type": "bool"
+        },
+        {
+          "name": "flash_loan_fee",
+          "type": "u32"
         }
       ]
     },
@@ -578,6 +901,77 @@
         },
         {
           "name": "token_program"
+        }
+      ],
+      "args": [
+        {
+          "name": "lp_tokens",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "withdraw_stake_account",
+      "discriminator": [
+        211,
+        85,
+        184,
+        65,
+        183,
+        177,
+        233,
+        217
+      ],
+      "accounts": [
+        {
+          "name": "pool",
+          "writable": true
+        },
+        {
+          "name": "sol_vault",
+          "writable": true
+        },
+        {
+          "name": "lp_mint",
+          "writable": true
+        },
+        {
+          "name": "user",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "user_lp_account",
+          "writable": true
+        },
+        {
+          "name": "stake_account_destination",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "stake_account_source",
+          "docs": [
+            "The stake account must either 1) have enough delegated stake to cover the split amount + the minimum delegation (1 SOL currently),",
+            "OR 2) have exactly the amount of stake (plus reserve) that is being withdrawn."
+          ],
+          "writable": true
+        },
+        {
+          "name": "stake_account_info_source",
+          "writable": true
+        },
+        {
+          "name": "system_program"
+        },
+        {
+          "name": "token_program"
+        },
+        {
+          "name": "stake_program"
+        },
+        {
+          "name": "clock"
         }
       ],
       "args": [
@@ -766,6 +1160,81 @@
       "code": 6029,
       "name": "SlippageExceeded",
       "msg": "The slippage was exceeded"
+    },
+    {
+      "code": 6030,
+      "name": "SplitStakeFailed",
+      "msg": "Stake split failed"
+    },
+    {
+      "code": 6031,
+      "name": "WithdrawToStakeIncorrectAmount",
+      "msg": "The amount to withdraw to the stake account is incorrect, e.g. has to be at leats 1 SOL and the remaining balance must also be at least 1 SOL"
+    },
+    {
+      "code": 6032,
+      "name": "FlashLoanNotRepaidInSameTransaction",
+      "msg": "Flash loan not repaid in the same transaction"
+    },
+    {
+      "code": 6033,
+      "name": "FlashLoanRepaymentAmountInsufficient",
+      "msg": "Flash loan repayment amount is insufficient"
+    },
+    {
+      "code": 6034,
+      "name": "FlashLoanExceedsAvailableLiquidity",
+      "msg": "Flash loan amount exceeds available liquidity"
+    },
+    {
+      "code": 6035,
+      "name": "FlashBorrowAlreadyActive",
+      "msg": "Flash borrow already active - cannot borrow again without repaying"
+    },
+    {
+      "code": 6036,
+      "name": "NoActiveFlashLoan",
+      "msg": "No active flash loan to repay"
+    },
+    {
+      "code": 6037,
+      "name": "FlashRepayInstructionNotFound",
+      "msg": "Flash repay instruction not found in transaction"
+    },
+    {
+      "code": 6038,
+      "name": "InvalidFlashRepayInstruction",
+      "msg": "Invalid flash repay instruction accounts"
+    },
+    {
+      "code": 6039,
+      "name": "FlashLoansDisabled",
+      "msg": "Flash loans are disabled for this pool"
+    },
+    {
+      "code": 6040,
+      "name": "FlashLoanCpiNotAllowed",
+      "msg": "Flash loan instructions cannot be called via CPI"
+    },
+    {
+      "code": 6041,
+      "name": "FlashLoanActive",
+      "msg": "Cannot deposit or withdraw LP tokens while flash loan is active"
+    },
+    {
+      "code": 6042,
+      "name": "InvalidFlashLoanFee",
+      "msg": "Invalid flash loan fee configuration"
+    },
+    {
+      "code": 6043,
+      "name": "InvalidWithdrawFee",
+      "msg": "Invalid withdraw fee configuration"
+    },
+    {
+      "code": 6044,
+      "name": "InvalidStakeAccountInfoAddress",
+      "msg": "Invalid stake account info PDA address"
     }
   ],
   "types": [
@@ -826,14 +1295,14 @@
           {
             "name": "fee_max",
             "docs": [
-              "The max fee that can be charged in basis points, 100% = FEE_BPS"
+              "The max fee that can be charged in basis points, 100% = FEE_PCT_DIVISOR"
             ],
             "type": "u32"
           },
           {
             "name": "fee_min",
             "docs": [
-              "The max fee that can be charged in basis points, 100% = FEE_BPS"
+              "The max fee that can be charged in basis points, 100% = FEE_PCT_DIVISOR"
             ],
             "type": "u32"
           },
@@ -880,6 +1349,49 @@
             "type": "u64"
           },
           {
+            "name": "withdraw_sol_fee",
+            "type": "u16"
+          },
+          {
+            "name": "withdraw_stake_account_fee",
+            "type": "u16"
+          },
+          {
+            "name": "flash_loan_fee",
+            "docs": [
+              "Flash loan fee, 100% = FEE_PCT_DIVISOR"
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "flash_loan_borrowed_amount",
+            "docs": [
+              "Currently borrowed amount (used to track active flash loan)"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "flash_loans_enabled",
+            "docs": [
+              "Whether flash loans are enabled for this pool"
+            ],
+            "type": "bool"
+          },
+          {
+            "name": "total_stake_rewards_withdrawn",
+            "docs": [
+              "Rewards that have been withdrawn from stake accounts"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "last_stake_rewards_withdrawn_epoch",
+            "docs": [
+              "The epoch that stake rewards were last withdrawn"
+            ],
+            "type": "u32"
+          },
+          {
             "name": "reserved",
             "docs": [
               "Reservation for future contract changes"
@@ -887,7 +1399,7 @@
             "type": {
               "array": [
                 "u8",
-                32
+                3
               ]
             }
           }

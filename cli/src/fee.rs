@@ -1,12 +1,14 @@
-use anyhow::Result;
+use anchor_lang::prelude::*;
+use liquid_unstaker::liquid_unstaker::accounts::Pool;
+
+use crate::error::LiquidUnstakerErrorCode;
+
+pub const FEE_PCT_DIVISOR: u32 = 100_000;
 
 pub struct Fee {
     pub base_fee: u64,
     pub manager_fee: u64,
 }
-
-pub const FEE_PCT_BPS: u32 = 100_000;
-
 
 impl Fee {
 
@@ -21,15 +23,17 @@ impl Fee {
             return Ok(amount);
         }
 
-        Ok(u64::try_from((amount as u128) * (numerator as u128) / (denominator as u128))?)
+        u64::try_from((amount as u128) * (numerator as u128) / (denominator as u128))
+            .map_err(|_| error!(LiquidUnstakerErrorCode::MathOverflow))
     }
 
-    pub fn calculate_base_fee(
-        pool: &liquid_unstaker::liquid_unstaker::accounts::Pool, 
-        current_sol_vault_lamports: u64, 
-        unstake_lamports: u64) -> Result<u64> {
+    pub fn calculate_base_fee(pool: &Pool, current_sol_vault_lamports: u64, unstake_lamports: u64) -> Result<u64> {
 
-        if current_sol_vault_lamports - unstake_lamports >= pool.min_sol_for_min_fee {
+        let remaining_lamports = current_sol_vault_lamports
+            .checked_sub(unstake_lamports)
+            .ok_or(LiquidUnstakerErrorCode::MathUnderflow)?;
+
+        if remaining_lamports >= pool.min_sol_for_min_fee {
             // We will stay above the minimum fee threshold, the base fee is always equal to fee_min
             Ok(pool.fee_min.into())
         } else {
@@ -43,19 +47,19 @@ impl Fee {
 
                 Ok((pool.fee_min as u64)
                     .checked_mul(amount_above_min_fee_threshold)
-                    .ok_or(anyhow::anyhow!("Overflow"))?
+                    .ok_or(LiquidUnstakerErrorCode::MathOverflow)?
                     .checked_add(Fee::calculate_linear_base_fee(
                         (pool.fee_max - pool.fee_min).into(),
                         amount_below_min_fee_threshold, 
                         pool.min_sol_for_min_fee)?
                         .checked_add(pool.fee_min.into())
-                        .ok_or(anyhow::anyhow!("Overflow"))?
+                        .ok_or(LiquidUnstakerErrorCode::MathOverflow)?
                         .checked_mul(amount_below_min_fee_threshold)
-                        .ok_or(anyhow::anyhow!("Overflow"))?
+                        .ok_or(LiquidUnstakerErrorCode::MathOverflow)?
                     )
-                    .ok_or(anyhow::anyhow!("Overflow"))?
+                    .ok_or(LiquidUnstakerErrorCode::MathOverflow)?
                     .checked_div(unstake_lamports)
-                    .ok_or(anyhow::anyhow!("Underflow"))?)
+                    .ok_or(LiquidUnstakerErrorCode::MathUnderflow)?)
             } else {
 
                 // We will fall below the minimum fee threshold, calculate a linear fee between fee_min and fee_max, depending
@@ -69,3 +73,4 @@ impl Fee {
     }
 
 }
+
