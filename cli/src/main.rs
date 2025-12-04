@@ -42,6 +42,20 @@ const SUPPORTED_STAKE_POOL_PROGRAMS: [Pubkey; 3] = [
     SANCTUM_MULTIPLE_VALIDATORS_STAKE_POOL_PROGRAM,
 ];
 
+enum PubkeyOrKeypair {
+    Pubkey(Pubkey),
+    Keypair(Keypair),
+}
+
+impl PubkeyOrKeypair {
+    fn pubkey(&self) -> Pubkey {
+        match self {
+            PubkeyOrKeypair::Pubkey(p) => *p,
+            PubkeyOrKeypair::Keypair(k) => k.pubkey(),
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Define the CLI using clap
@@ -56,6 +70,14 @@ async fn main() -> Result<()> {
             Arg::new("simulate")
                 .long("simulate")
                 .help("Simulate the transaction without sending it")
+                .value_parser(clap::value_parser!(bool))
+                .action(clap::ArgAction::SetTrue)
+                .required(false)
+        )
+        .arg(
+            Arg::new("no-stake-account-as-pda")
+                .long("no-stake-account-as-pda")
+                .help("Do not create new stake accounts as PDAs (for unstake-lst and unstake-lst-wrapped commands)")
                 .value_parser(clap::value_parser!(bool))
                 .action(clap::ArgAction::SetTrue)
                 .required(false)
@@ -171,6 +193,7 @@ async fn main() -> Result<()> {
     let rpc_url: &String = matches.get_one("rpc").unwrap();
     let unstake_pool_id = Pubkey::from_str(matches.get_one::<String>("pool").unwrap()).unwrap();
     let simulate = *matches.get_one::<bool>("simulate").unwrap_or(&false);
+    let new_stake_account_as_pda = !*matches.get_one::<bool>("no-stake-account-as-pda").unwrap_or(&false);
     let wallet_keypair = {
         
         // Load the wallet keypair file
@@ -243,7 +266,10 @@ async fn main() -> Result<()> {
                 let in_amount = *arg_matches.get_one::<u64>("amount").unwrap();
 
                 let (quote_wsol, fees) =
-                    quote_lst_unstake_wrapped(&spl_stake_pool_state, &unstake_pool_info, in_amount)?;
+                    quote_lst_unstake_wrapped(&spl_stake_pool_state, 
+                        &unstake_pool_info, 
+                        in_amount, 
+                        new_stake_account_as_pda)?;
 
                 println!(
                     "Quote: {} wsol and {} lamports received for {} {:?} tokens",
@@ -278,6 +304,7 @@ async fn main() -> Result<()> {
                     &unstake_pool_info,
                     *amount,
                     simulate,
+                    new_stake_account_as_pda,
                 )
                 .await?;
             } else {
@@ -309,6 +336,7 @@ async fn main() -> Result<()> {
                     &unstake_pool_info,
                     *amount,
                     simulate,
+                    new_stake_account_as_pda,
                 )
                 .await?;
             } else {
@@ -439,6 +467,7 @@ async fn unstake_lst(
     unstake_pool_info: &liquid_unstaker::liquid_unstaker::accounts::Pool,
     amount: u64,
     simulate: bool,
+    new_stake_account_as_pda: bool,
 ) -> Result<()> {
     let rpc = program.rpc();
 
@@ -456,15 +485,29 @@ async fn unstake_lst(
         })??;
 
     // Get all the accounts we need for liquid unstaking, and calculate amounts to pass to the liquid unstake instruction
+    let stake_account_seed= unstake_pool_info.total_deactivating_stake;
 
     let (lst_amounts, withdraw_stake_accounts, new_stake_accounts, new_stake_pda_accounts) =
-        get_unstake_accounts(
-            &spl_stake_pool_program_id,
-            &spl_stake_pool_address,
-            &spl_stake_pool_state,
-            &spl_stake_pool_validator_list,
-            amount,
-        )?;
+        if new_stake_account_as_pda {
+        
+            get_unstake_accounts_with_new_stake_account_as_pda(
+                &spl_stake_pool_program_id,
+                &spl_stake_pool_address,
+                &spl_stake_pool_state,
+                &spl_stake_pool_validator_list,
+                stake_account_seed,
+                &wallet_keypair.pubkey(),
+                amount,
+            )?
+        } else {
+            get_unstake_accounts(
+                &spl_stake_pool_program_id,
+                &spl_stake_pool_address,
+                &spl_stake_pool_state,
+                &spl_stake_pool_validator_list,
+                amount,
+            )?
+        };
 
     let lst_amounts = lst_amounts
         .into_iter()
@@ -483,7 +526,7 @@ async fn unstake_lst(
     )
     .0;
 
-    let instructions = program
+    let builder = program
         .request()
         .accounts(
             liquid_unstaker::liquid_unstaker::client::accounts::LiquidUnstakeLst {
@@ -514,47 +557,76 @@ async fn unstake_lst(
                 .collect_vec(),
             new_stake_accounts
                 .iter()
-                .map(|x| AccountMeta::new(x.pubkey(), true))
+                .map(|x| AccountMeta::new(x.pubkey(), !new_stake_account_as_pda))
                 .collect_vec(),
             new_stake_pda_accounts
                 .into_iter()
                 .map(|x| AccountMeta::new(x, false))
                 .collect_vec(),
-        ])
-        .args(
-            liquid_unstaker::liquid_unstaker::client::args::LiquidUnstakeLst {
-                lst_amounts,
-                minimum_lamports_out: None,
-            },
-        )
-        .instructions()?;
+        ]);
+
+    let mut instructions = if new_stake_account_as_pda {
+        builder
+            .args(
+                liquid_unstaker::liquid_unstaker::client::args::LiquidUnstakeLstWithSeed {
+                    lst_amounts,
+                    minimum_lamports_out: None,
+                    stake_account_seed: stake_account_seed,
+                },
+            )
+            .instructions()?
+
+    } else {
+        builder
+            .args(
+                liquid_unstaker::liquid_unstaker::client::args::LiquidUnstakeLst {
+                    lst_amounts,
+                    minimum_lamports_out: None,
+                },
+            )
+            .instructions()?
+    };
 
     // We need to create the new stake accounts before we can send the transaction
-    let create_instructions = new_stake_accounts
-        .iter()
-        .map(|stake_account_keypair| {
-            create_account(
-                &wallet_keypair.pubkey(),
-                &stake_account_keypair.pubkey(),
-                solana_sdk::rent::Rent::default()
-                    .minimum_balance(solana_sdk::stake::state::StakeStateV2::size_of()),
-                solana_sdk::stake::state::StakeStateV2::size_of() as u64,
-                &solana_sdk::stake::program::id(),
-            )
-        })
-        .collect_vec();
+    if !new_stake_account_as_pda {
+        let create_instructions = new_stake_accounts
+            .iter()
+            .map(|stake_account_keypair| {
+                create_account(
+                    &wallet_keypair.pubkey(),
+                    &stake_account_keypair.pubkey(),
+                    solana_sdk::rent::Rent::default()
+                        .minimum_balance(solana_sdk::stake::state::StakeStateV2::size_of()),
+                    solana_sdk::stake::state::StakeStateV2::size_of() as u64,
+                    &solana_sdk::stake::program::id(),
+                )
+            })
+            .collect_vec();
+
+        instructions.splice(0..0, create_instructions);
+    }
+
+
+    instructions.insert(0, solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(1_000_000));
 
     // Build transaction
     let recent_blockhash = rpc.get_latest_blockhash().await?;
 
-    let signers = [
-        vec![wallet_keypair],
-        new_stake_accounts.iter().collect_vec(),
-    ]
-    .concat();
+    let mut signers = vec![wallet_keypair];
+
+    if !new_stake_account_as_pda {
+        
+        for stake_account in new_stake_accounts.iter() {
+            if let PubkeyOrKeypair::Keypair(k) = stake_account {
+                signers.push(k);
+            } else {
+                return Err(anyhow::anyhow!("Expected Keypair for new stake account when using PDA option"));
+            }
+        }
+    }
 
     let tx = Transaction::new_signed_with_payer(
-        &[create_instructions, instructions].concat(),
+        &instructions,
         Some(&wallet_keypair.pubkey()),
         &signers,
         recent_blockhash,
@@ -581,6 +653,7 @@ async fn unstake_lst_wrapped(
     unstake_pool_info: &liquid_unstaker::liquid_unstaker::accounts::Pool,
     amount: u64,
     simulate: bool,
+    new_stake_account_as_pda: bool,
 ) -> Result<()> {
     let rpc = program.rpc();
 
@@ -598,15 +671,29 @@ async fn unstake_lst_wrapped(
         })??;
 
     // Get all the accounts we need for liquid unstaking, and calculate amounts to pass to the liquid unstake instruction
+    let stake_account_seed = unstake_pool_info.total_deactivating_stake;
 
     let (lst_amounts, withdraw_stake_accounts, new_stake_accounts, new_stake_pda_accounts) =
-        get_unstake_accounts(
-            &spl_stake_pool_program_id,
-            &spl_stake_pool_address,
-            &spl_stake_pool_state,
-            &spl_stake_pool_validator_list,
-            amount,
-        )?;
+        if new_stake_account_as_pda {
+        
+            get_unstake_accounts_with_new_stake_account_as_pda(
+                &spl_stake_pool_program_id,
+                &spl_stake_pool_address,
+                &spl_stake_pool_state,
+                &spl_stake_pool_validator_list,
+                stake_account_seed,
+                &wallet_keypair.pubkey(),
+                amount,
+            )?
+        } else {
+            get_unstake_accounts(
+                &spl_stake_pool_program_id,
+                &spl_stake_pool_address,
+                &spl_stake_pool_state,
+                &spl_stake_pool_validator_list,
+                amount,
+            )?
+        };
 
     let lst_amounts = lst_amounts
         .into_iter()
@@ -630,7 +717,7 @@ async fn unstake_lst_wrapped(
     )
     .0;
 
-    let mut instructions = program
+    let builder = program
         .request()
         .accounts(
             liquid_unstaker::liquid_unstaker::client::accounts::LiquidUnstakeLstWithWrapped {
@@ -660,48 +747,67 @@ async fn unstake_lst_wrapped(
                 .collect_vec(),
             new_stake_accounts
                 .iter()
-                .map(|x| AccountMeta::new(x.pubkey(), true))
+                .map(|x| AccountMeta::new(x.pubkey(), !new_stake_account_as_pda))
                 .collect_vec(),
             new_stake_pda_accounts
                 .into_iter()
                 .map(|x| AccountMeta::new(x, false))
                 .collect_vec(),
-        ])
-        .args(
-            liquid_unstaker::liquid_unstaker::client::args::LiquidUnstakeLstWithWrapped {
-                lst_amounts,
-                minimum_lamports_out: None,
-            },
-        )
-        .instructions()?;
+        ]);
+
+    let mut instructions = if new_stake_account_as_pda {
+
+            builder.args(liquid_unstaker::liquid_unstaker::client::args::LiquidUnstakeLstWithWrappedSeed {
+                    lst_amounts,
+                    minimum_lamports_out: None,
+                    stake_account_seed: stake_account_seed
+                })
+                .instructions()?
+        } else {
+            builder.args(liquid_unstaker::liquid_unstaker::client::args::LiquidUnstakeLstWithWrapped {
+                    lst_amounts,
+                    minimum_lamports_out: None,
+                })
+                .instructions()?
+        };
+        
+
+    if !new_stake_account_as_pda {
+        // We need to create the new stake accounts before we can send the transaction
+        let create_instructions = new_stake_accounts
+            .iter()
+            .map(|stake_account_keypair| {
+                create_account(
+                    &wallet_keypair.pubkey(),
+                    &stake_account_keypair.pubkey(),
+                    solana_sdk::rent::Rent::default()
+                        .minimum_balance(solana_sdk::stake::state::StakeStateV2::size_of()),
+                    solana_sdk::stake::state::StakeStateV2::size_of() as u64,
+                    &solana_sdk::stake::program::id(),
+                )
+            })
+            .collect_vec();
+
+        instructions.splice(0..0, create_instructions);
+    }
 
     instructions.insert(0, solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(1_000_000));
-
-    /*
-    // We need to create the new stake accounts before we can send the transaction
-    let create_instructions = new_stake_accounts
-        .iter()
-        .map(|stake_account_keypair| {
-            create_account(
-                &wallet_keypair.pubkey(),
-                &stake_account_keypair.pubkey(),
-                solana_sdk::rent::Rent::default()
-                    .minimum_balance(solana_sdk::stake::state::StakeStateV2::size_of()),
-                solana_sdk::stake::state::StakeStateV2::size_of() as u64,
-                &solana_sdk::stake::program::id(),
-            )
-        })
-        .collect_vec();
-    */
 
     // Build transaction
     let recent_blockhash = rpc.get_latest_blockhash().await?;
 
-    let signers = [
-        vec![wallet_keypair],
-        new_stake_accounts.iter().collect_vec(),
-    ]
-    .concat();
+    let mut signers = vec![wallet_keypair];
+
+    if !new_stake_account_as_pda {
+        
+        for stake_account in new_stake_accounts.iter() {
+            if let PubkeyOrKeypair::Keypair(k) = stake_account {
+                signers.push(k);
+            } else {
+                return Err(anyhow::anyhow!("Expected Keypair for new stake account when using PDA option"));
+            }
+        }
+    }
 
     let tx = Transaction::new_signed_with_payer(
         &instructions,
@@ -930,6 +1036,7 @@ pub fn quote_lst_unstake_wrapped(
     stake_pool_state: &StakePool,
     liquid_unstake_pool_state: &liquid_unstaker::liquid_unstaker::accounts::Pool,
     pool_tokens: u64,
+    new_stake_account_as_pda: bool,
 ) -> Result<(i64, i64)> {
     let pool_tokens_fee = stake_pool_state
         .calc_pool_tokens_stake_withdrawal_fee(pool_tokens)
@@ -973,9 +1080,11 @@ pub fn quote_lst_unstake_wrapped(
     let fee_amount = fee.total_fee();
 
     let wsol_amount_out = total_amount_to_unstake as i64 - fee_amount as i64 - stake_account_rent as i64;
+    let wsol_amount_out_extra_if_user_payed_for_new_stake_account = if !new_stake_account_as_pda { stake_account_rent as i64 } else { 0 };
+
     let lamports_amount_out = 0;
 
-    return Ok((wsol_amount_out, lamports_amount_out));
+    return Ok((wsol_amount_out + wsol_amount_out_extra_if_user_payed_for_new_stake_account, lamports_amount_out));
 }
 
 fn get_unstake_accounts(
@@ -984,7 +1093,7 @@ fn get_unstake_accounts(
     stake_pool_state: &spl_stake_pool::state::StakePool,
     stake_pool_validator_list: &spl_stake_pool::state::ValidatorList,
     amount_in: u64,
-) -> Result<(Vec<u64>, Vec<Pubkey>, Vec<Keypair>, Vec<Pubkey>)> {
+) -> Result<(Vec<u64>, Vec<Pubkey>, Vec<PubkeyOrKeypair>, Vec<Pubkey>)> {
     #[derive(Clone)]
     struct AccountInfo {
         is_preferred: bool,
@@ -1110,7 +1219,162 @@ fn get_unstake_accounts(
     Ok((
         lst_amounts,
         withdraw_stake_accounts,
-        new_stake_accounts,
+        new_stake_accounts.into_iter().map(PubkeyOrKeypair::Keypair).collect(),
+        new_stake_pda_accounts,
+    ))
+}
+
+
+fn get_unstake_accounts_with_new_stake_account_as_pda(
+    stake_pool_program: &Pubkey,
+    stake_pool_address: &Pubkey,
+    stake_pool_state: &spl_stake_pool::state::StakePool,
+    stake_pool_validator_list: &spl_stake_pool::state::ValidatorList,
+    stake_account_seed: u64,
+    token_transfer_authority: &Pubkey,
+    amount_in: u64,
+) -> Result<(Vec<u64>, Vec<Pubkey>, Vec<PubkeyOrKeypair>, Vec<Pubkey>)> {
+    #[derive(Clone)]
+    struct AccountInfo {
+        is_preferred: bool,
+        stake_address: Pubkey,
+        lamports: u64,
+    }
+
+    let mut lst_amounts = Vec::new();
+
+    let accounts = stake_pool_validator_list
+        .validators
+        .iter()
+        .filter(|validator_info| validator_info.status == StakeStatus::Active.into())
+        .filter(|validator_info| Into::<u64>::into(validator_info.active_stake_lamports) != 0u64)
+        .map(|validator_info| {
+            let stake_account_address = find_stake_program_address(
+                stake_pool_program,
+                &validator_info.vote_account_address,
+                stake_pool_address,
+                None,
+            )
+            .0;
+
+            let is_preferred = stake_pool_state.preferred_withdraw_validator_vote_address
+                == Some(validator_info.vote_account_address);
+
+            let active_stake_lamports: u64 =
+                Into::<u64>::into(validator_info.active_stake_lamports);
+
+            AccountInfo {
+                is_preferred,
+                stake_address: stake_account_address,
+                lamports: active_stake_lamports,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    // Prepare the list of accounts to withdraw from
+    let mut remaining_amount = amount_in;
+
+    let fee = &stake_pool_state.stake_withdrawal_fee;
+    let inverse_fee_numerator = fee.denominator - fee.numerator;
+    let inverse_fee_denominator = fee.denominator;
+
+    let calc_pool_tokens_for_deposit = |stake_lamports: u64| -> u128 {
+        if stake_pool_state.pool_token_supply == 0 || stake_pool_state.total_lamports == 0 {
+            return stake_lamports as u128;
+        }
+        let numerator = stake_lamports as u128 * stake_pool_state.pool_token_supply as u128;
+
+        return numerator / stake_pool_state.total_lamports as u128;
+    };
+
+    let mut withdraw_from = Vec::<AccountInfo>::new();
+
+    for is_preferred in [true, false].iter() {
+        let filtered_accounts = accounts
+            .iter()
+            .filter(|a| a.is_preferred == *is_preferred)
+            // Sort by lamports descending as we prefer to unstake from the largest stake accounts first
+            .sorted_by(|a, b| b.lamports.cmp(&a.lamports));
+
+        for account in filtered_accounts {
+            let mut available_for_withdrawal = calc_pool_tokens_for_deposit(account.lamports);
+
+            if inverse_fee_numerator != 0 {
+                available_for_withdrawal = available_for_withdrawal
+                    .mul(inverse_fee_denominator as u128)
+                    .div(inverse_fee_numerator as u128);
+            }
+
+            let pool_amount = (available_for_withdrawal as u64).min(remaining_amount);
+
+            if pool_amount == 0 {
+                continue;
+            }
+
+            withdraw_from.push(account.clone());
+            lst_amounts.push(pool_amount);
+
+            remaining_amount -= pool_amount;
+
+            if remaining_amount == 0 {
+                break;
+            }
+        }
+
+        if remaining_amount == 0 {
+            break;
+        }
+    }
+
+    if remaining_amount > 0 {
+        return Err(anyhow::anyhow!("Not enough pool tokens to unstake"));
+    }
+
+    withdraw_from.iter().for_each(|account| {
+        println!("Withdrawing from stake account {:?} that has {} lamports", account.stake_address, account.lamports);
+    });
+
+    let withdraw_stake_accounts = withdraw_from
+        .iter()
+        .map(|address| address.stake_address)
+        .collect_vec();
+    let new_stake_accounts = withdraw_from
+        .iter()
+        .enumerate()
+        .map(|(i, _)| {
+            // PDA for the new stake account is derived from
+            //
+            //  1. The payer, which we assume is SwapParams.token_transfer_authority
+            //  2. The seed, which is total_deactivating_stake + i
+            //
+            let (pubkey, _) = Pubkey::find_program_address(
+                &[b"stake_account", token_transfer_authority.as_ref(), (stake_account_seed + i as u64).to_le_bytes().as_ref()],
+                &liquid_unstaker::liquid_unstaker::ID_CONST,
+            );
+
+            println!("Derived new stake account PDA: {}", pubkey);
+
+            pubkey
+        })
+        .collect::<Vec<_>>();
+    let new_stake_pda_accounts = new_stake_accounts
+        .iter()
+        .map(|stake_account_keypair| {
+            Pubkey::find_program_address(
+                &[
+                    b"stake_account_info",
+                    stake_account_keypair.as_ref(),
+                ],
+                &liquid_unstaker::liquid_unstaker::ID_CONST,
+            )
+            .0
+        })
+        .collect::<Vec<_>>();
+
+    Ok((
+        lst_amounts,
+        withdraw_stake_accounts,
+        new_stake_accounts.into_iter().map(PubkeyOrKeypair::Pubkey).collect(),
         new_stake_pda_accounts,
     ))
 }
