@@ -25,7 +25,7 @@ pub enum LiquidUnstakerErrorCode {
     #[msg("Unauthorized stake account")]
     UnauthorizedStakeAccount,
     #[msg("Stake account has already been processed.")]
-    StakeAccountAlreadyProcessed,    
+    StakeAccountAlreadyProcessed,
     #[msg("Stake accounts mismatch")]
     StakeAccountMismatch,
     #[msg("Failed to deserialize")]
