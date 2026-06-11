@@ -96,6 +96,15 @@ liquid-unstaker-client-cli \
   sync-inventory --chunk-size 8
 ```
 
+### Inventory status
+
+```sh
+liquid-unstaker-client-cli \
+  --pool <POOL> \
+  --rpc "$RPC_URL" \
+  inventory-status
+```
+
 ### List pool LST inventory
 
 Prints CSV rows as `mint,amount` for configured LST info entries where the pool-owned token balance is greater than zero.

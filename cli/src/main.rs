@@ -76,6 +76,8 @@ const LST_INFO_BUMP_OFFSET: usize = LST_INFO_STAKE_POOL_PROGRAM_OFFSET + PUBKEY_
 const LST_INFO_IS_ACTIVE_OFFSET: usize = LST_INFO_BUMP_OFFSET + 1;
 const LST_INFO_V3_DATA_LEN: usize =
     ANCHOR_DISCRIMINATOR_LEN + 32 + 32 + 32 + 32 + 1 + 1 + 4 + 1 + 1 + 5 * 8 + 5 * 8 + 1;
+const INVENTORY_SYNC_ACCOUNTS_PER_ENTRY: usize = 2;
+const INVENTORY_SYNC_ENTRIES_PER_RPC_BATCH: usize = 100 / INVENTORY_SYNC_ACCOUNTS_PER_ENTRY;
 
 type ProgramClient = anchor_client::Program<Rc<Keypair>>;
 type PoolAccount = lu_accounts::Pool;
@@ -337,6 +339,10 @@ async fn main() -> Result<()> {
                         .help("Abort/clear an in-progress inventory sync")
                         .action(ArgAction::SetTrue),
                 ),
+        )
+        .subcommand(
+            Command::new("inventory-status")
+                .about("Report whether the v3 inventory summary is current without syncing"),
         )
         .subcommand(
             Command::new("update")
@@ -704,6 +710,9 @@ async fn main() -> Result<()> {
                 simulate,
             )
             .await?;
+        }
+        Some(("inventory-status", _)) => {
+            inventory_status(&program, &unstake_pool_id).await?;
         }
         Some(("update", arg_matches)) => {
             let stake_accounts = parse_optional_pubkey_values(arg_matches, "stake-account")?;
@@ -1502,9 +1511,24 @@ async fn sync_inventory(
         println!("Aborting/clearing inventory sync session; no LSTs will be synced");
         vec![vec![]]
     } else {
+        let pool = fetch_pool(program, *pool_id).await?;
         let lst_info_records = list_lst_info_records(&program.rpc(), pool_id).await?;
         print_lst_info_records(&lst_info_records);
         let entries = active_inventory_entries_from_records(pool_id, lst_info_records);
+
+        if let Some(reason) =
+            inventory_sync_needed(&program.rpc(), pool_id, &pool, &inventory_summary, &entries)
+                .await?
+        {
+            println!("Inventory sync needed: {reason}");
+        } else {
+            println!(
+                "Inventory summary is already current for {} active v3 LST inventory entries; no sync transaction sent",
+                entries.len()
+            );
+            return Ok(());
+        }
+
         if entries.is_empty() {
             println!("No active v3 LST inventory entries found for sync");
             vec![vec![]]
@@ -1568,12 +1592,58 @@ async fn sync_inventory(
     Ok(())
 }
 
+async fn inventory_status(program: &ProgramClient, pool_id: &Pubkey) -> Result<()> {
+    let inventory_summary = inventory_summary_address(pool_id);
+    let pool = fetch_pool(program, *pool_id).await?;
+    let lst_info_records = list_lst_info_records(&program.rpc(), pool_id).await?;
+    let lst_info_count = lst_info_records.len();
+    let entries = active_inventory_entries_from_records(pool_id, lst_info_records);
+
+    println!("InventorySummary {inventory_summary}");
+    if let Some(summary) =
+        fetch_anchor_account::<InventorySummaryAccount>(&program.rpc(), &inventory_summary).await?
+    {
+        println!("  total_value_snapshot={}", summary.total_value_snapshot);
+        println!("  snapshot_epoch={}", summary.snapshot_epoch);
+        println!("  snapshot_progress={}", summary.snapshot_progress);
+        println!("  snapshot_slot={}", summary.snapshot_slot);
+        println!("  sync_in_progress={}", summary.sync_in_progress);
+    } else {
+        println!("  missing");
+    }
+    println!("LstInfo accounts={lst_info_count}");
+    println!("Active v3 inventory entries={}", entries.len());
+    println!(
+        "Pool active_lst_mints_count={}",
+        pool.active_lst_mints_count
+    );
+
+    if let Some(reason) =
+        inventory_sync_needed(&program.rpc(), pool_id, &pool, &inventory_summary, &entries).await?
+    {
+        println!("Status: needs update");
+        println!("Reason: {reason}");
+    } else {
+        println!("Status: current");
+    }
+
+    Ok(())
+}
+
 #[derive(Clone)]
 struct InventoryEntry {
     mint: Pubkey,
     pool_lst_token_account: Pubkey,
     stake_pool: Pubkey,
     lst_info: Pubkey,
+    rate_history_epochs: [u64; 5],
+    rate_history_rates: [u64; 5],
+    rate_history_len: u8,
+}
+
+enum InventoryValueCheck {
+    CurrentValue(u64),
+    NeedsSync(String),
 }
 
 fn active_inventory_entries_from_records(
@@ -1595,10 +1665,169 @@ fn active_inventory_entries_from_records(
             pool_lst_token_account,
             stake_pool: lst_info.stake_pool,
             lst_info: record.address,
+            rate_history_epochs: lst_info.rate_history_epochs,
+            rate_history_rates: lst_info.rate_history_rates,
+            rate_history_len: lst_info.rate_history_len,
         });
     }
 
     active
+}
+
+async fn inventory_sync_needed(
+    rpc: &RpcClient,
+    pool_id: &Pubkey,
+    pool: &PoolAccount,
+    inventory_summary: &Pubkey,
+    entries: &[InventoryEntry],
+) -> Result<Option<String>> {
+    let Some(summary) =
+        fetch_anchor_account::<InventorySummaryAccount>(rpc, inventory_summary).await?
+    else {
+        return Ok(Some(format!(
+            "missing InventorySummary {inventory_summary}"
+        )));
+    };
+
+    if summary.pool != *pool_id {
+        return Ok(Some(format!(
+            "InventorySummary {inventory_summary} belongs to pool {}, expected {pool_id}",
+            summary.pool
+        )));
+    }
+
+    if summary.sync_in_progress {
+        return Ok(Some(format!(
+            "inventory sync is already in progress for {inventory_summary}"
+        )));
+    }
+
+    let epoch_info = rpc.get_epoch_info().await?;
+    if summary.snapshot_epoch != epoch_info.epoch {
+        return Ok(Some(format!(
+            "inventory summary is from epoch {}, current epoch {}",
+            summary.snapshot_epoch, epoch_info.epoch
+        )));
+    }
+
+    if entries.len() != pool.active_lst_mints_count as usize {
+        return Ok(Some(format!(
+            "pool tracks {} active LST mints but found {} active v3 LST info accounts",
+            pool.active_lst_mints_count,
+            entries.len()
+        )));
+    }
+
+    let current_value = match inventory_value_at_snapshot_progress(
+        rpc,
+        pool,
+        entries,
+        summary.snapshot_epoch,
+        summary.snapshot_progress,
+    )
+    .await?
+    {
+        InventoryValueCheck::CurrentValue(value) => value,
+        InventoryValueCheck::NeedsSync(reason) => return Ok(Some(reason)),
+    };
+    if current_value != summary.total_value_snapshot {
+        return Ok(Some(format!(
+            "inventory summary value is {}, current active inventory value is {}",
+            summary.total_value_snapshot, current_value
+        )));
+    }
+
+    Ok(None)
+}
+
+async fn inventory_value_at_snapshot_progress(
+    rpc: &RpcClient,
+    pool: &PoolAccount,
+    entries: &[InventoryEntry],
+    snapshot_epoch: u64,
+    snapshot_progress: u64,
+) -> Result<InventoryValueCheck> {
+    let mut total_value = 0_u64;
+
+    for chunk in entries.chunks(INVENTORY_SYNC_ENTRIES_PER_RPC_BATCH) {
+        let account_keys = chunk
+            .iter()
+            .flat_map(|entry| [entry.pool_lst_token_account, entry.stake_pool])
+            .collect_vec();
+        let accounts = rpc.get_multiple_accounts(&account_keys).await?;
+        if accounts.len() != account_keys.len() {
+            return Err(anyhow!(
+                "RPC returned {} accounts, expected {}",
+                accounts.len(),
+                account_keys.len()
+            ));
+        }
+
+        for (entry, accounts) in chunk
+            .iter()
+            .zip(accounts.chunks_exact(INVENTORY_SYNC_ACCOUNTS_PER_ENTRY))
+        {
+            let lst_amount = accounts[0]
+                .as_ref()
+                .and_then(token_amount_from_account)
+                .unwrap_or(0);
+            if lst_amount == 0 {
+                return Ok(InventoryValueCheck::NeedsSync(format!(
+                    "active LST {} has zero or missing pool token account {}",
+                    entry.mint, entry.pool_lst_token_account
+                )));
+            }
+
+            let stake_pool_account = accounts[1]
+                .as_ref()
+                .ok_or_else(|| anyhow!("missing stake pool account {}", entry.stake_pool))?;
+            let mut data = stake_pool_account.data.as_slice();
+            let stake_pool_state = StakePool::deserialize(&mut data).map_err(|err| {
+                anyhow!(
+                    "failed to deserialize stake pool account {}: {err}",
+                    entry.stake_pool
+                )
+            })?;
+
+            let current_rate = calculate_stake_pool_rate(&stake_pool_state)?;
+            if !lst_info_has_recorded_rate(entry, snapshot_epoch, current_rate) {
+                return Ok(InventoryValueCheck::NeedsSync(format!(
+                    "LST {} has not recorded current epoch {} rate {}",
+                    entry.mint, snapshot_epoch, current_rate
+                )));
+            }
+
+            let value = calculate_lst_sol_value(
+                lst_amount,
+                stake_pool_state.total_lamports,
+                stake_pool_state.pool_token_supply,
+                snapshot_progress,
+                pool.expected_inflation_per_epoch,
+            )?;
+            total_value = total_value
+                .checked_add(value)
+                .ok_or_else(|| anyhow!("inventory value overflow"))?;
+        }
+    }
+
+    Ok(InventoryValueCheck::CurrentValue(total_value))
+}
+
+fn calculate_stake_pool_rate(stake_pool: &StakePool) -> Result<u64> {
+    if stake_pool.pool_token_supply == 0 {
+        return Err(anyhow!("stake pool token supply is zero"));
+    }
+
+    Ok((stake_pool.total_lamports as u128)
+        .checked_mul(RATE_SCALE)
+        .ok_or_else(|| anyhow!("rate overflow"))?
+        .checked_div(stake_pool.pool_token_supply as u128)
+        .ok_or_else(|| anyhow!("rate underflow"))? as u64)
+}
+
+fn lst_info_has_recorded_rate(entry: &InventoryEntry, epoch: u64, rate: u64) -> bool {
+    (0..(entry.rate_history_len as usize).min(entry.rate_history_epochs.len()))
+        .any(|i| entry.rate_history_epochs[i] == epoch && entry.rate_history_rates[i] == rate)
 }
 
 async fn update(
