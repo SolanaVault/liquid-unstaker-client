@@ -40,6 +40,10 @@ liquid-unstaker-client-cli --pool <POOL> --rpc <RPC_URL> sell-lst --help
 liquid-unstaker-client-cli --pool <POOL> --rpc <RPC_URL> unstake-pool-lsts --help
 ```
 
+Use `--dump-transaction-message` with any transaction command to print the base58-encoded Solana
+message bytes instead of signing or sending. When dumping, `--keypair` may be either a keypair file
+or the signer pubkey, which is useful for external signing flows such as Ledger.
+
 ## Examples
 
 ### Quote a v3 LST sale

@@ -6,6 +6,7 @@ use std::{
     ops::{Div, Mul},
     rc::Rc,
     str::FromStr,
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use anchor_client::{
@@ -78,12 +79,36 @@ const LST_INFO_V3_DATA_LEN: usize =
     ANCHOR_DISCRIMINATOR_LEN + 32 + 32 + 32 + 32 + 1 + 1 + 4 + 1 + 1 + 5 * 8 + 5 * 8 + 1;
 const INVENTORY_SYNC_ACCOUNTS_PER_ENTRY: usize = 2;
 const INVENTORY_SYNC_ENTRIES_PER_RPC_BATCH: usize = 100 / INVENTORY_SYNC_ACCOUNTS_PER_ENTRY;
+static DUMP_TRANSACTION_MESSAGE: AtomicBool = AtomicBool::new(false);
 
 type ProgramClient = anchor_client::Program<Rc<Keypair>>;
 type PoolAccount = lu_accounts::Pool;
 type LstInfoAccount = lu_accounts::LstInfo;
 type InventorySummaryAccount = lu_accounts::InventorySummary;
 type StakeAccountInfoAccount = lu_accounts::StakeAccountInfo;
+
+enum Wallet {
+    Keypair(Keypair),
+    Pubkey(Pubkey),
+}
+
+impl Wallet {
+    fn pubkey(&self) -> Pubkey {
+        match self {
+            Wallet::Keypair(k) => k.pubkey(),
+            Wallet::Pubkey(p) => *p,
+        }
+    }
+
+    fn keypair(&self, context: &str) -> Result<&Keypair> {
+        match self {
+            Wallet::Keypair(k) => Ok(k),
+            Wallet::Pubkey(p) => Err(anyhow!(
+                "{context} requires a local keypair, but --keypair was provided as pubkey {p}"
+            )),
+        }
+    }
+}
 
 enum PubkeyOrKeypair {
     Pubkey(Pubkey),
@@ -167,6 +192,14 @@ async fn main() -> Result<()> {
                 .long("simulate")
                 .help("Simulate the transaction without sending it")
                 .action(ArgAction::SetTrue)
+                .required(false),
+        )
+        .arg(
+            Arg::new("dump-transaction-message")
+                .long("dump-transaction-message")
+                .help("Print the base58-encoded transaction message instead of signing or sending it. With this flag, --keypair may be a signer pubkey")
+                .action(ArgAction::SetTrue)
+                .conflicts_with("simulate")
                 .required(false),
         )
         .arg(
@@ -461,12 +494,21 @@ async fn main() -> Result<()> {
     let rpc_url: &String = matches.get_one("rpc").unwrap();
     let unstake_pool_id = parse_pubkey(matches.get_one::<String>("pool").unwrap(), "pool")?;
     let simulate = matches.get_flag("simulate");
+    let dump_transaction_message = matches.get_flag("dump-transaction-message");
+    DUMP_TRANSACTION_MESSAGE.store(dump_transaction_message, Ordering::Relaxed);
     let new_stake_account_as_pda = !matches.get_flag("no-stake-account-as-pda");
-    let wallet_keypair = load_wallet_keypair(matches.get_one::<String>("keypair"))?;
+    let wallet_keypair = load_wallet(
+        matches.get_one::<String>("keypair"),
+        dump_transaction_message,
+    )?;
+    let client_keypair = wallet_keypair
+        .keypair("client setup")
+        .map(|keypair| keypair.insecure_clone())
+        .unwrap_or_else(|_| Keypair::new());
 
     let client = Client::new(
         anchor_client::Cluster::Custom(rpc_url.clone(), rpc_url.clone()),
-        Rc::new(wallet_keypair.insecure_clone()),
+        Rc::new(client_keypair),
     );
     let program: ProgramClient = client.program(ID_CONST)?;
 
@@ -638,7 +680,7 @@ async fn main() -> Result<()> {
             let quote = quote_buy_lst(
                 &program,
                 &unstake_pool_id,
-                &wallet_keypair,
+                wallet_keypair.keypair("quote-buy-lst")?,
                 &pool,
                 &mint,
                 amount,
@@ -946,11 +988,19 @@ fn parse_optional_pubkey_values(
         .map(Some)
 }
 
-fn load_wallet_keypair(path: Option<&String>) -> Result<Keypair> {
+fn load_wallet(path: Option<&String>, allow_pubkey: bool) -> Result<Wallet> {
     if let Some(path) = path {
-        read_keypair_file(path).map_err(|_| anyhow!("failed to read wallet keypair file {path}"))
+        match read_keypair_file(path) {
+            Ok(keypair) => Ok(Wallet::Keypair(keypair)),
+            Err(_) if allow_pubkey => parse_pubkey(path, "keypair").map(Wallet::Pubkey),
+            Err(_) => Err(anyhow!("failed to read wallet keypair file {path}")),
+        }
+    } else if allow_pubkey {
+        Err(anyhow!(
+            "--dump-transaction-message requires --keypair with a wallet pubkey or keypair file"
+        ))
     } else {
-        Ok(Keypair::new())
+        Ok(Wallet::Keypair(Keypair::new()))
     }
 }
 
@@ -1058,7 +1108,7 @@ fn token_amount_from_ui_account(account: &UiAccount) -> Option<u64> {
 async fn deposit_sol(
     program: &ProgramClient,
     pool_id: &Pubkey,
-    wallet: &Keypair,
+    wallet: &Wallet,
     pool: &PoolAccount,
     lamports: u64,
     simulate: bool,
@@ -1095,7 +1145,7 @@ async fn deposit_sol(
 async fn withdraw_sol(
     program: &ProgramClient,
     pool_id: &Pubkey,
-    wallet: &Keypair,
+    wallet: &Wallet,
     pool: &PoolAccount,
     lp_tokens: u64,
     simulate: bool,
@@ -1125,7 +1175,7 @@ async fn withdraw_sol(
 async fn initialize_pool(
     program: &ProgramClient,
     pool_id: &Pubkey,
-    wallet: &Keypair,
+    wallet: &Wallet,
     args: &clap::ArgMatches,
     simulate: bool,
 ) -> Result<()> {
@@ -1184,7 +1234,7 @@ async fn initialize_pool(
 async fn withdraw_stake_account(
     program: &ProgramClient,
     pool_id: &Pubkey,
-    wallet: &Keypair,
+    wallet: &Wallet,
     destination_stake_account: &Keypair,
     pool: &PoolAccount,
     stake_account_source: Pubkey,
@@ -1234,7 +1284,7 @@ async fn withdraw_stake_account(
 async fn liquid_unstake_stake_account(
     program: &ProgramClient,
     pool_id: &Pubkey,
-    wallet: &Keypair,
+    wallet: &Wallet,
     pool: &PoolAccount,
     stake_account: Pubkey,
     minimum_lamports_out: Option<u64>,
@@ -1281,7 +1331,7 @@ async fn liquid_unstake_stake_account(
 async fn sell_lst(
     program: &ProgramClient,
     pool_id: &Pubkey,
-    wallet: &Keypair,
+    wallet: &Wallet,
     pool: &PoolAccount,
     mint: &Pubkey,
     amount: u64,
@@ -1418,7 +1468,7 @@ fn buy_lst_instructions(
 async fn buy_lst(
     program: &ProgramClient,
     pool_id: &Pubkey,
-    wallet: &Keypair,
+    wallet: &Wallet,
     pool: &PoolAccount,
     mint: &Pubkey,
     amount: u64,
@@ -1462,7 +1512,7 @@ async fn buy_lst(
 async fn upsert_lst_info(
     program: &ProgramClient,
     pool_id: &Pubkey,
-    wallet: &Keypair,
+    wallet: &Wallet,
     mint: &Pubkey,
     stake_pool: &Pubkey,
     enabled: bool,
@@ -1496,7 +1546,7 @@ async fn upsert_lst_info(
 async fn sync_inventory(
     program: &ProgramClient,
     pool_id: &Pubkey,
-    wallet: &Keypair,
+    wallet: &Wallet,
     chunk_size: usize,
     abort: bool,
     simulate: bool,
@@ -1833,7 +1883,7 @@ fn lst_info_has_recorded_rate(entry: &InventoryEntry, epoch: u64, rate: u64) -> 
 async fn update(
     program: &ProgramClient,
     pool_id: &Pubkey,
-    wallet: &Keypair,
+    wallet: &Wallet,
     stake_accounts: Option<&[Pubkey]>,
     chunk_size: usize,
     simulate: bool,
@@ -1867,7 +1917,7 @@ async fn update(
 async fn update_chunk(
     program: &ProgramClient,
     pool_id: &Pubkey,
-    wallet: &Keypair,
+    wallet: &Wallet,
     stake_account_infos: &[(Pubkey, Pubkey)],
     simulate: bool,
 ) -> Result<()> {
@@ -1960,7 +2010,7 @@ async fn stake_account_infos_for_update(
 async fn unstake_pool_lsts_for_selection(
     program: &ProgramClient,
     pool_id: &Pubkey,
-    wallet: &Keypair,
+    wallet: &Wallet,
     mint_selection: PoolLstMintSelection,
     amount_selection: PoolLstAmountSelection,
     stake_account_seed: Option<u64>,
@@ -2059,7 +2109,7 @@ async fn resolve_pool_lst_unstake_requests(
 async fn unstake_pool_lsts(
     program: &ProgramClient,
     pool_id: &Pubkey,
-    wallet: &Keypair,
+    wallet: &Wallet,
     spl_stake_pool_program_id: &Pubkey,
     mint: &Pubkey,
     pool: &PoolAccount,
@@ -2168,7 +2218,7 @@ async fn unstake_pool_lsts(
 async fn update_pool(
     program: &ProgramClient,
     pool_id: &Pubkey,
-    wallet: &Keypair,
+    wallet: &Wallet,
     args: &clap::ArgMatches,
     simulate: bool,
 ) -> Result<()> {
@@ -2227,7 +2277,7 @@ async fn update_pool(
 async fn halt_pool(
     program: &ProgramClient,
     pool_id: &Pubkey,
-    wallet: &Keypair,
+    wallet: &Wallet,
     halted: bool,
     simulate: bool,
 ) -> Result<()> {
@@ -2254,7 +2304,7 @@ async fn halt_pool(
 async fn create_or_update_token_metadata(
     program: &ProgramClient,
     pool_id: &Pubkey,
-    wallet: &Keypair,
+    wallet: &Wallet,
     token_mint: Pubkey,
     name: String,
     symbol: String,
@@ -2290,7 +2340,7 @@ async fn create_or_update_token_metadata(
 async fn unstake_lst(
     program: &ProgramClient,
     unstake_pool_id: &Pubkey,
-    wallet_keypair: &Keypair,
+    wallet_keypair: &Wallet,
     spl_stake_pool_program_id: &Pubkey,
     mint: &Pubkey,
     unstake_pool_info: &PoolAccount,
@@ -2461,7 +2511,7 @@ async fn unstake_lst(
 async fn unstake_lst_wrapped(
     program: &ProgramClient,
     unstake_pool_id: &Pubkey,
-    wallet_keypair: &Keypair,
+    wallet_keypair: &Wallet,
     spl_stake_pool_program_id: &Pubkey,
     mint: &Pubkey,
     unstake_pool_info: &PoolAccount,
@@ -2637,18 +2687,27 @@ async fn unstake_lst_wrapped(
 
 async fn send_instructions(
     program: &ProgramClient,
-    payer: &Keypair,
+    payer: &Wallet,
     instructions: Vec<Instruction>,
     extra_signers: &[&Keypair],
     simulate: bool,
     simulation_accounts_of_interest: Option<Vec<Pubkey>>,
 ) -> Result<()> {
     let recent_blockhash = program.rpc().get_latest_blockhash().await?;
-    let mut signers = vec![payer];
+    let payer_pubkey = payer.pubkey();
+    if DUMP_TRANSACTION_MESSAGE.load(Ordering::Relaxed) {
+        let message =
+            Message::new_with_blockhash(&instructions, Some(&payer_pubkey), &recent_blockhash);
+        let tx = Transaction::new_unsigned(message);
+        println!("{}", encode_transaction_message(&tx));
+        return Ok(());
+    }
+
+    let mut signers = vec![payer.keypair("sending or simulating a transaction")?];
     signers.extend_from_slice(extra_signers);
     let tx = Transaction::new_signed_with_payer(
         &instructions,
-        Some(&payer.pubkey()),
+        Some(&payer_pubkey),
         &signers,
         recent_blockhash,
     );
@@ -2659,6 +2718,10 @@ async fn send_instructions(
         simulation_accounts_of_interest,
     )
     .await
+}
+
+fn encode_transaction_message(tx: &Transaction) -> String {
+    bs58::encode(tx.message_data()).into_string()
 }
 
 async fn get_stake_pool_for_mint_from_supported_programs(
@@ -4165,5 +4228,23 @@ mod tests {
             Some(true)
         );
         assert_eq!(lst_info_version(data.len()), "v2");
+    }
+
+    #[test]
+    fn load_wallet_accepts_pubkey_when_dumping() {
+        let pubkey = Pubkey::new_unique();
+        let value = pubkey.to_string();
+
+        match load_wallet(Some(&value), true).unwrap() {
+            Wallet::Pubkey(loaded) => assert_eq!(loaded, pubkey),
+            Wallet::Keypair(_) => panic!("expected pubkey wallet"),
+        }
+    }
+
+    #[test]
+    fn load_wallet_rejects_pubkey_without_dumping() {
+        let value = Pubkey::new_unique().to_string();
+
+        assert!(load_wallet(Some(&value), false).is_err());
     }
 }

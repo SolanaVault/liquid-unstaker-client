@@ -14,3 +14,4 @@ anyhow.workspace = true
 spl-stake-pool.workspace = true
 itertools.workspace = true
 solana-account-decoder.workspace = true
+bs58 = "0.5.1"
