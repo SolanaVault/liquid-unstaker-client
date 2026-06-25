@@ -63,6 +63,9 @@ const SUPPORTED_STAKE_POOL_PROGRAMS: [Pubkey; 3] = [
 
 const INFLATION_PCT_DIVISOR: u64 = 1_000_000_000;
 const RATE_SCALE: u128 = 1_000_000_000;
+const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
+const TOKEN_DECIMAL_FACTOR: u128 = 1_000_000_000;
+const MAX_WITHDRAW_FEE: u16 = (FEE_PCT_DIVISOR / 100) as u16;
 const BUY_REFERENCE_INVENTORY: u64 = 1_000_000_000_000;
 const BUY_ACTIVITY_SCALING: u64 = 100;
 const DEFAULT_UPDATE_CHUNK_SIZE: usize = 8;
@@ -488,6 +491,7 @@ async fn main() -> Result<()> {
                         .action(ArgAction::SetTrue),
                 ),
         )
+        .subcommand(Command::new("vlp-price").about("Print the current VLP/LP token price"))
         .subcommand(Command::new("pool-info").about("Print the decoded pool account"))
         .get_matches();
 
@@ -862,6 +866,9 @@ async fn main() -> Result<()> {
                     entry.last_synced_session_id
                 );
             }
+        }
+        Some(("vlp-price", _)) => {
+            print_vlp_price(&program, &unstake_pool_id).await?;
         }
         Some(("pool-info", _)) => {
             let pool = fetch_pool(&program, unstake_pool_id).await?;
@@ -1678,6 +1685,292 @@ async fn inventory_status(program: &ProgramClient, pool_id: &Pubkey) -> Result<(
     }
 
     Ok(())
+}
+
+async fn print_vlp_price(program: &ProgramClient, pool_id: &Pubkey) -> Result<()> {
+    let rpc = program.rpc();
+    let pool = fetch_pool(program, *pool_id).await?;
+    if pool.flash_loan_borrowed_amount != 0 {
+        return Err(anyhow!(
+            "LP operations are blocked while a flash loan is active"
+        ));
+    }
+
+    let epoch_info = rpc.get_epoch_info().await?;
+    let epoch_progress =
+        epoch_progress_from_slot_index(epoch_info.slot_index, epoch_info.slots_in_epoch)?;
+    let inventory_summary_address = inventory_summary_address(pool_id);
+    let inventory_summary =
+        fetch_anchor_account::<InventorySummaryAccount>(&rpc, &inventory_summary_address).await?;
+    let inventory_value = accrue_inventory_summary_value(
+        inventory_summary.as_ref(),
+        pool_id,
+        &pool,
+        epoch_info.epoch,
+        epoch_progress,
+    )?;
+
+    let total_sol_in_vault_plus_pending = pool
+        .sol_vault_lamports
+        .checked_add(pool.total_deactivating_stake)
+        .ok_or_else(|| anyhow!("pool value overflow"))?;
+    let total_pool_value = total_sol_in_vault_plus_pending
+        .checked_add(inventory_value)
+        .ok_or_else(|| anyhow!("pool value overflow"))?;
+    let unvested_rewards =
+        calculate_unvested_stake_rewards(&pool, epoch_info.epoch, epoch_progress)?;
+    let priced_pool_value = total_pool_value
+        .checked_sub(unvested_rewards)
+        .ok_or_else(|| anyhow!("pool value underflow after unvested rewards"))?;
+    let one_vlp_withdraw_gross = (pool.total_lp_tokens != 0)
+        .then(|| {
+            calculate_lamports_to_withdraw_for_lp(
+                pool.total_lp_tokens,
+                LAMPORTS_PER_SOL,
+                total_pool_value,
+                0,
+                unvested_rewards,
+            )
+        })
+        .transpose()?;
+    let one_sol_deposit_vlp_tokens = calculate_tokens_to_mint_for_deposit(
+        pool.total_lp_tokens,
+        LAMPORTS_PER_SOL,
+        total_pool_value,
+        unvested_rewards,
+    )?;
+    let one_sol_deposit_exceeds_cap = total_pool_value
+        .checked_add(LAMPORTS_PER_SOL)
+        .ok_or_else(|| anyhow!("pool value overflow"))?
+        > pool.sol_vault_lamports_cap;
+
+    println!("lp_mint={}", pool.lp_mint);
+    println!("total_lp_tokens={}", pool.total_lp_tokens);
+    println!("sol_vault_lamports={}", pool.sol_vault_lamports);
+    println!(
+        "total_deactivating_stake_lamports={}",
+        pool.total_deactivating_stake
+    );
+    println!("inventory_summary={inventory_summary_address}");
+    println!("inventory_value_lamports={inventory_value}");
+    println!("total_pool_value_lamports={total_pool_value}");
+    println!("unvested_rewards_lamports={unvested_rewards}");
+    println!("priced_pool_value_lamports={priced_pool_value}");
+
+    println!("one_sol_deposit_vlp_tokens={one_sol_deposit_vlp_tokens}");
+    if one_sol_deposit_exceeds_cap {
+        println!("one_sol_deposit_note=deposit would exceed pool.sol_vault_lamports_cap");
+    } else if one_sol_deposit_vlp_tokens == 0 {
+        println!("one_sol_deposit_note=deposit would fail with LpTokensToMintIsZero");
+    }
+
+    if let Some(gross_price) = one_vlp_withdraw_gross {
+        println!("gross_price_lamports_per_vlp={gross_price}");
+        println!(
+            "gross_price_sol_per_vlp={}",
+            format_lamports_as_sol(u128::from(gross_price))
+        );
+
+        let withdraw_sol_price = calculate_lamports_to_withdraw_for_lp(
+            pool.total_lp_tokens,
+            LAMPORTS_PER_SOL,
+            total_pool_value,
+            pool.withdraw_sol_fee,
+            unvested_rewards,
+        )?;
+        let withdraw_stake_account_price = calculate_lamports_to_withdraw_for_lp(
+            pool.total_lp_tokens,
+            LAMPORTS_PER_SOL,
+            total_pool_value,
+            pool.withdraw_stake_account_fee,
+            unvested_rewards,
+        )?;
+        println!("withdraw_sol_fee={}", pool.withdraw_sol_fee);
+        println!("withdraw_sol_price_lamports_per_vlp={withdraw_sol_price}");
+        println!(
+            "withdraw_sol_price_sol_per_vlp={}",
+            format_lamports_as_sol(u128::from(withdraw_sol_price))
+        );
+        if pool.sol_vault_lamports < withdraw_sol_price {
+            println!("withdraw_sol_note=pool SOL vault cannot cover this withdrawal amount");
+        }
+        println!(
+            "withdraw_stake_account_fee={}",
+            pool.withdraw_stake_account_fee
+        );
+        println!("withdraw_stake_account_price_lamports_per_vlp={withdraw_stake_account_price}");
+        println!(
+            "withdraw_stake_account_price_sol_per_vlp={}",
+            format_lamports_as_sol(u128::from(withdraw_stake_account_price))
+        );
+    } else {
+        println!("price_note=no LP supply; there is no current withdrawable share price");
+    }
+
+    Ok(())
+}
+
+fn accrue_inventory_summary_value(
+    summary: Option<&InventorySummaryAccount>,
+    pool_id: &Pubkey,
+    pool: &PoolAccount,
+    current_epoch: u64,
+    epoch_progress: u64,
+) -> Result<u64> {
+    let Some(summary) = summary else {
+        return Ok(0);
+    };
+    if summary.sync_in_progress {
+        return Err(anyhow!(
+            "inventory sync is in progress for {}; finish or abort sync-inventory before reading VLP price",
+            inventory_summary_address(pool_id)
+        ));
+    }
+    if summary.pool == Pubkey::default() {
+        return Ok(0);
+    }
+    if summary.pool != *pool_id {
+        return Err(anyhow!(
+            "InventorySummary {} belongs to pool {}, expected {pool_id}",
+            inventory_summary_address(pool_id),
+            summary.pool
+        ));
+    }
+    if summary.snapshot_epoch == 0 || summary.total_value_snapshot == 0 {
+        return Ok(summary.total_value_snapshot);
+    }
+    if summary.snapshot_epoch != current_epoch {
+        return Err(anyhow!(
+            "inventory summary is from epoch {}, current epoch {}; run sync-inventory",
+            summary.snapshot_epoch,
+            current_epoch
+        ));
+    }
+    if summary.snapshot_progress > epoch_progress {
+        return Err(anyhow!(
+            "inventory summary snapshot progress is ahead of current epoch progress"
+        ));
+    }
+
+    let multiplier_now =
+        calculate_inflation_multiplier(epoch_progress, pool.expected_inflation_per_epoch)?;
+    let multiplier_snapshot = calculate_inflation_multiplier(
+        summary.snapshot_progress,
+        pool.expected_inflation_per_epoch,
+    )?;
+
+    Ok(u64::try_from(
+        u128::from(summary.total_value_snapshot)
+            .checked_mul(u128::from(multiplier_now))
+            .ok_or_else(|| anyhow!("inventory accrual overflow"))?
+            .checked_div(u128::from(multiplier_snapshot))
+            .ok_or_else(|| anyhow!("inventory accrual underflow"))?,
+    )
+    .map_err(|_| anyhow!("inventory accrual overflow"))?)
+}
+
+fn calculate_unvested_stake_rewards(
+    pool: &PoolAccount,
+    current_epoch: u64,
+    epoch_progress: u64,
+) -> Result<u64> {
+    if u64::from(pool.last_stake_rewards_withdrawn_epoch) != current_epoch {
+        return Ok(0);
+    }
+    let vested = (pool.total_stake_rewards_withdrawn as u128)
+        .checked_mul(epoch_progress as u128)
+        .ok_or_else(|| anyhow!("reward vesting overflow"))?
+        .checked_div(u64::MAX as u128)
+        .ok_or_else(|| anyhow!("reward vesting underflow"))? as u64;
+    pool.total_stake_rewards_withdrawn
+        .checked_sub(vested)
+        .ok_or_else(|| anyhow!("reward vesting underflow"))
+}
+
+fn calculate_tokens_to_mint_for_deposit(
+    lp_mint_supply: u64,
+    lamports_to_deposit: u64,
+    lamports_total_in_pool: u64,
+    unvested_rewards: u64,
+) -> Result<u64> {
+    if lamports_to_deposit == 0 {
+        return Err(anyhow!("deposit amount must be greater than zero"));
+    }
+
+    if lp_mint_supply == 0 || lamports_total_in_pool == 0 {
+        return lamports_to_deposit
+            .checked_add(lamports_total_in_pool)
+            .ok_or_else(|| anyhow!("deposit mint overflow"))?
+            .checked_sub(lp_mint_supply)
+            .ok_or_else(|| anyhow!("deposit mint underflow"));
+    }
+
+    let priced_pool_value = lamports_total_in_pool
+        .checked_sub(unvested_rewards)
+        .ok_or_else(|| anyhow!("pool value underflow after unvested rewards"))?;
+
+    Ok(u64::try_from(
+        u128::from(lp_mint_supply)
+            .checked_mul(u128::from(lamports_to_deposit))
+            .ok_or_else(|| anyhow!("deposit mint overflow"))?
+            .checked_div(u128::from(priced_pool_value))
+            .ok_or_else(|| anyhow!("deposit mint underflow"))?,
+    )
+    .map_err(|_| anyhow!("deposit mint overflow"))?)
+}
+
+fn calculate_lamports_to_withdraw_for_lp(
+    lp_mint_supply: u64,
+    lp_to_burn: u64,
+    lamports_total_in_pool: u64,
+    fee: u16,
+    unvested_rewards: u64,
+) -> Result<u64> {
+    if lamports_total_in_pool == 0 || lp_mint_supply == 0 {
+        return Ok(0);
+    }
+
+    let priced_pool_value = lamports_total_in_pool
+        .checked_sub(unvested_rewards)
+        .ok_or_else(|| anyhow!("pool value underflow after unvested rewards"))?;
+    let base_amount = u64::try_from(
+        u128::from(lp_to_burn)
+            .checked_mul(u128::from(priced_pool_value))
+            .ok_or_else(|| anyhow!("withdraw amount overflow"))?
+            .checked_div(u128::from(lp_mint_supply))
+            .ok_or_else(|| anyhow!("withdraw amount underflow"))?,
+    )
+    .map_err(|_| anyhow!("withdraw amount overflow"))?;
+
+    let fee_lamports = calculate_withdraw_fee(base_amount, fee)?;
+    base_amount
+        .checked_sub(fee_lamports)
+        .ok_or_else(|| anyhow!("withdraw amount underflow"))
+}
+
+fn calculate_withdraw_fee(amount: u64, fee: u16) -> Result<u64> {
+    if fee > MAX_WITHDRAW_FEE {
+        return Err(anyhow!("invalid withdraw fee"));
+    }
+
+    Ok(u64::try_from(
+        u128::from(amount)
+            .checked_mul(u128::from(fee))
+            .ok_or_else(|| anyhow!("withdraw fee overflow"))?
+            .checked_div(u128::from(FEE_PCT_DIVISOR))
+            .ok_or_else(|| anyhow!("withdraw fee underflow"))?,
+    )
+    .map_err(|_| anyhow!("withdraw fee overflow"))?)
+}
+
+fn format_lamports_as_sol(lamports: u128) -> String {
+    format_scaled_decimal(lamports, TOKEN_DECIMAL_FACTOR, 9)
+}
+
+fn format_scaled_decimal(value: u128, scale: u128, decimals: usize) -> String {
+    let whole = value / scale;
+    let fraction = value % scale;
+    format!("{whole}.{fraction:0decimals$}")
 }
 
 #[derive(Clone)]
@@ -3650,13 +3943,17 @@ async fn check_epoch_progress(rpc: &RpcClient, max_epoch_progress_pct: u8) -> Re
 
 async fn get_epoch_progress(rpc: &RpcClient) -> Result<u64> {
     let epoch_info = rpc.get_epoch_info().await?;
-    if epoch_info.slots_in_epoch == 0 {
+    epoch_progress_from_slot_index(epoch_info.slot_index, epoch_info.slots_in_epoch)
+}
+
+fn epoch_progress_from_slot_index(slot_index: u64, slots_in_epoch: u64) -> Result<u64> {
+    if slots_in_epoch == 0 {
         return Err(anyhow!("RPC returned zero slots_in_epoch"));
     }
-    Ok(((epoch_info.slot_index as u128)
+    Ok(((slot_index as u128)
         .checked_mul(u64::MAX as u128)
         .ok_or_else(|| anyhow!("epoch progress overflow"))?
-        .checked_div(epoch_info.slots_in_epoch as u128)
+        .checked_div(slots_in_epoch as u128)
         .ok_or_else(|| anyhow!("epoch progress underflow"))?) as u64)
 }
 
@@ -4246,5 +4543,66 @@ mod tests {
         let value = Pubkey::new_unique().to_string();
 
         assert!(load_wallet(Some(&value), false).is_err());
+    }
+
+    #[test]
+    fn calculate_lamports_to_withdraw_for_one_vlp_matches_share_price() {
+        assert_eq!(
+            calculate_lamports_to_withdraw_for_lp(
+                1_000_000_000,
+                LAMPORTS_PER_SOL,
+                2_000_000_000,
+                0,
+                0
+            )
+            .unwrap(),
+            2_000_000_000
+        );
+    }
+
+    #[test]
+    fn calculate_lamports_to_withdraw_applies_lp_fee_units() {
+        assert_eq!(
+            calculate_lamports_to_withdraw_for_lp(
+                1_000_000_000,
+                LAMPORTS_PER_SOL,
+                1_000_000_000,
+                50,
+                0
+            )
+            .unwrap(),
+            999_500_000
+        );
+    }
+
+    #[test]
+    fn calculate_tokens_to_mint_uses_initial_supply_branch() {
+        assert_eq!(
+            calculate_tokens_to_mint_for_deposit(0, LAMPORTS_PER_SOL, 500, 0).unwrap(),
+            LAMPORTS_PER_SOL + 500
+        );
+    }
+
+    #[test]
+    fn calculate_tokens_to_mint_subtracts_unvested_rewards_in_share_branch() {
+        assert_eq!(
+            calculate_tokens_to_mint_for_deposit(1_000, 100, 2_000, 500).unwrap(),
+            66
+        );
+    }
+
+    #[test]
+    fn epoch_progress_from_slot_index_uses_full_u64_range() {
+        assert_eq!(epoch_progress_from_slot_index(0, 10).unwrap(), 0);
+        assert_eq!(
+            epoch_progress_from_slot_index(5, 10).unwrap(),
+            (u64::MAX as u128 * 5 / 10) as u64
+        );
+        assert!(epoch_progress_from_slot_index(1, 0).is_err());
+    }
+
+    #[test]
+    fn format_lamports_as_sol_keeps_nine_decimals() {
+        assert_eq!(format_lamports_as_sol(1_234_567_890), "1.234567890");
     }
 }

@@ -12,6 +12,7 @@ This CLI targets v3 of the Liquid Unstaker protocol.
 - `sell-lst`, sell LST tokens directly to the pool for wrapped SOL
 - `quote-buy-lst`, quote the v3 marketplace `buy_lst` path
 - `buy-lst`, buy LST tokens from pool inventory with wrapped SOL
+- `vlp-price`, show the current LP/VLP token price used by LP operations
 - `deposit`, deposit SOL into the pool and receive LP tokens
 - `withdraw`, burn LP tokens and withdraw SOL from the pool
 - `withdraw-stake-account`, burn LP tokens and receive a pool-owned deactivating stake account split
@@ -88,6 +89,15 @@ liquid-unstaker-client-cli \
   --rpc "$RPC_URL" \
   --keypair "$AUTHORITY_KEYPAIR_PATH" \
   upsert-lst-info <LST_MINT>
+```
+
+### Show the LP token price
+
+```sh
+liquid-unstaker-client-cli \
+  --pool <POOL> \
+  --rpc "$RPC_URL" \
+  vlp-price
 ```
 
 ### Sync inventory
