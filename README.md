@@ -12,6 +12,7 @@ This CLI targets v3 of the Liquid Unstaker protocol.
 - `sell-lst`, sell LST tokens directly to the pool for wrapped SOL
 - `quote-buy-lst`, quote the v3 marketplace `buy_lst` path
 - `buy-lst`, buy LST tokens from pool inventory with wrapped SOL
+- `compare-price`, compare Jupiter SOL/LST pricing with v3 pool buy/sell quotes
 - `vlp-price`, show the current LP/VLP token price used by LP operations
 - `deposit`, deposit SOL into the pool and receive LP tokens
 - `withdraw`, burn LP tokens and withdraw SOL from the pool
@@ -78,6 +79,41 @@ liquid-unstaker-client-cli \
   --keypair "$KEYPAIR_PATH" \
   buy-lst vSoLxydx6akxyMD9XEcPvGYNGq6Nn66oqVb3UkGkei7 10000000 --max-lamports-in 11000000
 ```
+
+### Compare Jupiter and v3 prices
+
+`compare-price` uses Jupiter Swap V2 `/build` quotes for all enabled v3 LSTs and excludes
+`VaultLiquidUnstake` by default so the external quote does not route through this pool. It checks
+1 SOL by default. Set `JUPITER_API_KEY` or pass `--jupiter-api-key`; requests are paced by default
+to avoid Jupiter rate limits. The `sol_to_lst` v3 buy side is a hypothetical price comparison and
+does not require the pool to currently hold enough inventory to fill the buy. CSV output ends with
+`unstake_pool_better`, which is `true` when the v3 pool beats the Jupiter quote. When polling to
+stdout, the CSV header is printed once so the output can be redirected to an append-only CSV file.
+Disabled mints are excluded unless explicitly selected with `--mint` and `--allow-disabled-mint`.
+
+```sh
+export JUPITER_API_KEY="<JUPITER_API_KEY>"
+
+liquid-unstaker-client-cli \
+  --pool <POOL> \
+  --rpc "$RPC_URL" \
+  compare-price
+```
+
+For Prometheus textfile output:
+
+```sh
+liquid-unstaker-client-cli \
+  --pool <POOL> \
+  --rpc "$RPC_URL" \
+  compare-price \
+  --prometheus \
+  --poll-seconds 30 \
+  --output-file /tmp/liquid-unstaker-compare.prom
+```
+
+Use `--amount-sol`, `--mint`, `--allow-disabled-mint`, `--exclude-dex`,
+`--jupiter-request-delay-ms`, and `--jupiter-retries` to tune the sample set and API pacing.
 
 ### Enable an LST for v3 trading
 
@@ -165,6 +201,33 @@ liquid-unstaker-client-cli \
 ```
 
 When unstaking multiple mints with an explicit `--stake-account-seed`, the CLI advances the seed between transactions so derived stake-account PDAs are not reused.
+
+### Balanced unstake pool LST inventory
+
+`unstake-pools-lsts-balanced` calculates the pool TVL as SOL vault lamports plus tracked deactivating stake plus the current SOL value of pool-owned LST balances. It then plans partial LST unstakes so the remaining pool-owned LST value is at or below the supplied percentage of TVL while preserving the current SOL-value ratio across non-overridden LSTs. A 0.1 percentage-point trigger buffer is applied before planning, so a 5% cap only triggers balancing when current LST value is above 5.1%; once triggered, the target remains 5%.
+
+```sh
+liquid-unstaker-client-cli \
+  --pool <POOL> \
+  --rpc "$RPC_URL" \
+  --keypair "$MAINTENANCE_AUTHORITY_KEYPAIR_PATH" \
+  unstake-pools-lsts-balanced 10%
+```
+
+Repeat `--lst-target <MINT>:<PERCENT>` to override a mint's remaining target as a percentage of total pool TVL. Non-overridden LSTs share the remaining global cap in their current SOL-value ratio.
+
+```sh
+liquid-unstaker-client-cli \
+  --pool <POOL> \
+  --rpc "$RPC_URL" \
+  --keypair "$MAINTENANCE_AUTHORITY_KEYPAIR_PATH" \
+  --simulate \
+  unstake-pools-lsts-balanced 10% \
+  --lst-target <JUP_SOL_MINT>:4% \
+  --lst-target <JITO_SOL_MINT>:6%
+```
+
+If a mint's calculated remaining target is non-zero but below 1 SOL, the balanced plan targets zero and unstakes the full LST balance for that mint. If the full unstake would still produce a stake split below the stake program's minimum delegation, the CLI leaves that dust balance in place and prints a note in the plan.
 
 ### Update pool config
 

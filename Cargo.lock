@@ -2473,6 +2473,8 @@ dependencies = [
  "clap",
  "itertools 0.14.0",
  "liquid-unstaker",
+ "reqwest",
+ "serde",
  "solana-account-decoder",
  "spl-stake-pool",
  "tokio",

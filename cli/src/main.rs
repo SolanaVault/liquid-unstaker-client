@@ -1,12 +1,15 @@
 #![allow(clippy::too_many_arguments)]
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
+    env, fs,
+    io::{self, Write},
     mem::{offset_of, size_of},
     ops::{Div, Mul},
     rc::Rc,
     str::FromStr,
     sync::atomic::{AtomicBool, Ordering},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anchor_client::{
@@ -41,6 +44,7 @@ use clap::{Arg, ArgAction, Command};
 use fee::{Fee, FEE_PCT_DIVISOR};
 use itertools::{izip, Itertools};
 use liquid_unstaker::liquid_unstaker::{accounts as lu_accounts, client as lu_client, ID_CONST};
+use serde::Deserialize;
 use solana_account_decoder::{UiAccount, UiAccountEncoding};
 use spl_stake_pool::{
     find_stake_program_address,
@@ -69,6 +73,12 @@ const MAX_WITHDRAW_FEE: u16 = (FEE_PCT_DIVISOR / 100) as u16;
 const BUY_REFERENCE_INVENTORY: u64 = 1_000_000_000_000;
 const BUY_ACTIVITY_SCALING: u64 = 100;
 const DEFAULT_UPDATE_CHUNK_SIZE: usize = 8;
+const DEFAULT_COMPARE_SOL_LAMPORTS: [u64; 1] = [1_000_000_000];
+const DEFAULT_JUPITER_BUILD_URL: &str = "https://api.jup.ag/swap/v2/build";
+const DEFAULT_JUPITER_EXCLUDED_DEX: &str = "VaultLiquidUnstake";
+const PERCENT_SCALE: u128 = 1_000_000;
+const PERCENT_UNITS_PER_ONE_PERCENT: u128 = PERCENT_SCALE / 100;
+const BALANCED_LST_CAP_TRIGGER_BUFFER_PERCENT: u32 = 1_000;
 const MPL_TOKEN_METADATA_PROGRAM: Pubkey = pubkey!("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s");
 const ANCHOR_DISCRIMINATOR_LEN: usize = 8;
 const PUBKEY_DATA_LEN: usize = 32;
@@ -141,6 +151,61 @@ enum PoolLstAmountSelection {
     All,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PoolLstTargetOverride {
+    mint: Pubkey,
+    percent: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PoolLstUnstakeRequest {
+    mint: Pubkey,
+    amount: u64,
+    stake_pool_program_id: Option<Pubkey>,
+}
+
+#[derive(Clone, Debug)]
+struct PoolLstPositionSnapshot {
+    mint: Pubkey,
+    amount: u64,
+    sol_value: u64,
+    stake_pool_program_id: Pubkey,
+    stake_pool_total_lamports: u64,
+    stake_pool_token_supply: u64,
+    stake_withdrawal_fee: spl_stake_pool::state::Fee,
+}
+
+#[derive(Clone, Debug)]
+struct BalancedPoolLstPlanPosition {
+    mint: Pubkey,
+    current_amount: u64,
+    current_sol_value: u64,
+    current_sol_pct: u32,
+    target_amount: u64,
+    target_sol_value: u64,
+    target_sol_pct: u32,
+    unstake_amount: u64,
+    unstake_sol_lamports: u64,
+    override_percent: Option<u32>,
+    stake_pool_program_id: Pubkey,
+    note: Option<String>,
+}
+
+#[derive(Debug)]
+struct BalancedPoolLstPlan {
+    cap_percent: u32,
+    trigger_percent: u32,
+    sol_vault_lamports: u64,
+    total_deactivating_stake_lamports: u64,
+    current_lst_value_lamports: u128,
+    target_lst_value_lamports: u128,
+    trigger_lst_value_lamports: u128,
+    new_lst_value_lamports: u128,
+    tvl_lamports: u128,
+    minimum_unstake_lamports: u64,
+    positions: Vec<BalancedPoolLstPlanPosition>,
+}
+
 #[derive(Debug)]
 struct SellQuote {
     total_sol_value: u64,
@@ -171,6 +236,92 @@ struct BuyQuote {
     simulated_wallet_lamports_out: u64,
     simulated_user_wsol_amount_in: u64,
     simulated_user_lst_amount_out: u64,
+}
+
+#[derive(Debug)]
+struct ProtocolBuyQuote {
+    total_sol_value_without_discount: u64,
+    half_stake_pool_fee_pct: u64,
+    lst_cost: u64,
+    dynamic_fee_pct: u32,
+    pool_fee: u64,
+    manager_fee: u64,
+    total_fee: u64,
+    total_cost: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CompareDirection {
+    SolToLst,
+    LstToSol,
+}
+
+impl CompareDirection {
+    fn label(self) -> &'static str {
+        match self {
+            CompareDirection::SolToLst => "sol_to_lst",
+            CompareDirection::LstToSol => "lst_to_sol",
+        }
+    }
+}
+
+struct CompareRecord {
+    timestamp_unix: u64,
+    pool: Pubkey,
+    mint: Pubkey,
+    direction: CompareDirection,
+    notional_sol_lamports: u64,
+    lst_amount: Option<u64>,
+    jupiter_sol_lamports: Option<u64>,
+    jupiter_lst_amount: Option<u64>,
+    v3_sol_lamports: Option<u64>,
+    v3_lst_amount: Option<u64>,
+    v3_advantage_lamports: Option<i128>,
+    v3_advantage_bps: Option<f64>,
+    jupiter_route: Vec<String>,
+    error: Option<String>,
+}
+
+impl CompareRecord {
+    fn success(&self) -> bool {
+        self.error.is_none()
+    }
+}
+
+struct JupiterBuildClient {
+    http: reqwest::Client,
+    base_url: String,
+    api_key: Option<String>,
+    excluded_dexes: Vec<String>,
+    taker: Pubkey,
+    request_delay: Duration,
+    max_retries: u64,
+}
+
+struct JupiterQuote {
+    in_amount: u64,
+    out_amount: u64,
+    route_labels: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JupiterBuildQuoteResponse {
+    in_amount: String,
+    out_amount: String,
+    #[serde(default)]
+    route_plan: Vec<JupiterRoutePlanStep>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JupiterRoutePlanStep {
+    swap_info: JupiterSwapInfo,
+}
+
+#[derive(Debug, Deserialize)]
+struct JupiterSwapInfo {
+    label: String,
 }
 
 struct AccountSimulationDelta {
@@ -346,6 +497,100 @@ async fn main() -> Result<()> {
                 .arg(u64_pos_arg("amount", "LST token amount to buy")),
         )
         .subcommand(
+            Command::new("compare-price")
+                .about("Compare Jupiter SOL/LST quotes against v3 pool buy/sell quotes")
+                .arg(
+                    Arg::new("amount-sol")
+                        .long("amount-sol")
+                        .help("SOL notional to compare. Repeat to override the default: 1")
+                        .action(ArgAction::Append)
+                        .required(false),
+                )
+                .arg(
+                    Arg::new("mint")
+                        .long("mint")
+                        .help("Only compare this LST mint. Repeat to compare a subset")
+                        .action(ArgAction::Append)
+                        .required(false),
+                )
+                .arg(
+                    Arg::new("allow-disabled-mint")
+                        .long("allow-disabled-mint")
+                        .help("Allow explicitly selected disabled LST mints to be compared")
+                        .action(ArgAction::SetTrue)
+                        .required(false),
+                )
+                .arg(
+                    Arg::new("poll-seconds")
+                        .long("poll-seconds")
+                        .help("Poll continuously, waiting this many seconds between snapshots")
+                        .value_parser(clap::value_parser!(u64))
+                        .required(false),
+                )
+                .arg(
+                    Arg::new("output-file")
+                        .long("output-file")
+                        .help("Write the latest rendered snapshot to this file instead of stdout")
+                        .required(false),
+                )
+                .arg(
+                    Arg::new("prometheus")
+                        .long("prometheus")
+                        .help("Render Prometheus text exposition metrics")
+                        .action(ArgAction::SetTrue)
+                        .required(false),
+                )
+                .arg(
+                    Arg::new("jupiter-api-key")
+                        .long("jupiter-api-key")
+                        .help("Jupiter API key. If omitted, JUPITER_API_KEY is used when set")
+                        .required(false),
+                )
+                .arg(
+                    Arg::new("jupiter-url")
+                        .long("jupiter-url")
+                        .help("Jupiter Swap V2 build endpoint")
+                        .default_value(DEFAULT_JUPITER_BUILD_URL)
+                        .required(false),
+                )
+                .arg(
+                    Arg::new("jupiter-taker")
+                        .long("jupiter-taker")
+                        .help("Taker pubkey to pass to Jupiter build. Defaults to --keypair pubkey, or a generated pubkey")
+                        .required(false),
+                )
+                .arg(
+                    Arg::new("exclude-dex")
+                        .long("exclude-dex")
+                        .help("Jupiter DEX label to exclude. Repeatable; defaults to VaultLiquidUnstake")
+                        .action(ArgAction::Append)
+                        .required(false),
+                )
+                .arg(
+                    Arg::new("jupiter-timeout-seconds")
+                        .long("jupiter-timeout-seconds")
+                        .help("HTTP timeout for each Jupiter request")
+                        .value_parser(clap::value_parser!(u64))
+                        .default_value("10")
+                        .required(false),
+                )
+                .arg(
+                    Arg::new("jupiter-request-delay-ms")
+                        .long("jupiter-request-delay-ms")
+                        .help("Delay between Jupiter requests. Defaults to 1100ms with an API key and 2200ms without one")
+                        .value_parser(clap::value_parser!(u64))
+                        .required(false),
+                )
+                .arg(
+                    Arg::new("jupiter-retries")
+                        .long("jupiter-retries")
+                        .help("Retries for retryable Jupiter responses such as HTTP 429")
+                        .value_parser(clap::value_parser!(u64))
+                        .default_value("3")
+                        .required(false),
+                ),
+        )
+        .subcommand(
             Command::new("upsert-lst-info")
                 .about("Create or update the v3 LST allowlist entry for a mint")
                 .arg(string_arg("mint", "LST mint"))
@@ -403,6 +648,25 @@ async fn main() -> Result<()> {
                     "amount",
                     "LST token amount to unstake from pool inventory, or ALL",
                 ))
+                .arg(optional_u64_arg(
+                    "stake-account-seed",
+                    "Seed for destination stake account PDAs. Defaults to pool.total_deactivating_stake",
+                )),
+        )
+        .subcommand(
+            Command::new("unstake-pools-lsts-balanced")
+                .about("Authority-only: rebalance pool-owned LST inventory down to a TVL percentage cap")
+                .arg(string_arg(
+                    "cap-percent",
+                    "Maximum percent of total pool TVL to leave in LSTs, e.g. 10 or 10%",
+                ))
+                .arg(
+                    Arg::new("lst-target")
+                        .long("lst-target")
+                        .help("Override one mint's remaining target as MINT:PERCENT of total pool TVL. Repeat for multiple mints")
+                        .action(ArgAction::Append)
+                        .required(false),
+                )
                 .arg(optional_u64_arg(
                     "stake-account-seed",
                     "Seed for destination stake account PDAs. Defaults to pool.total_deactivating_stake",
@@ -692,6 +956,17 @@ async fn main() -> Result<()> {
             .await?;
             print_buy_quote(amount, mint, &quote);
         }
+        Some(("compare-price", arg_matches)) => {
+            let pool = fetch_pool(&program, unstake_pool_id).await?;
+            compare_price(
+                &program,
+                &unstake_pool_id,
+                &wallet_keypair,
+                &pool,
+                arg_matches,
+            )
+            .await?;
+        }
         Some(("sell-lst", arg_matches)) => {
             let pool = fetch_pool(&program, unstake_pool_id).await?;
             let mint = parse_pubkey(arg_matches.get_one::<String>("mint").unwrap(), "mint")?;
@@ -783,6 +1058,25 @@ async fn main() -> Result<()> {
                 &wallet_keypair,
                 parse_pool_lst_mint_selection(arg_matches.get_one::<String>("mint").unwrap())?,
                 parse_pool_lst_amount_selection(arg_matches.get_one::<String>("amount").unwrap())?,
+                arg_matches.get_one::<u64>("stake-account-seed").copied(),
+                simulate,
+            )
+            .await?;
+        }
+        Some(("unstake-pools-lsts-balanced", arg_matches)) => {
+            let pool = fetch_pool(&program, unstake_pool_id).await?;
+            let cap_percent = parse_percent_units(
+                arg_matches.get_one::<String>("cap-percent").unwrap(),
+                "cap-percent",
+            )?;
+            let overrides = parse_pool_lst_target_overrides(arg_matches)?;
+            unstake_pool_lsts_balanced(
+                &program,
+                &unstake_pool_id,
+                &wallet_keypair,
+                &pool,
+                cap_percent,
+                &overrides,
                 arg_matches.get_one::<u64>("stake-account-seed").copied(),
                 simulate,
             )
@@ -982,6 +1276,86 @@ fn parse_pool_lst_amount_selection(value: &str) -> Result<PoolLstAmountSelection
     Ok(PoolLstAmountSelection::Amount(amount))
 }
 
+fn parse_percent_units(value: &str, name: &str) -> Result<u32> {
+    let trimmed = value.trim();
+    let trimmed = trimmed.strip_suffix('%').unwrap_or(trimmed).trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("{name} percentage cannot be empty"));
+    }
+    if trimmed.starts_with('-') {
+        return Err(anyhow!("{name} percentage cannot be negative"));
+    }
+
+    let (whole, fraction) = trimmed
+        .split_once('.')
+        .map_or((trimmed, ""), |(whole, fraction)| (whole, fraction));
+    if whole.is_empty() && fraction.is_empty() {
+        return Err(anyhow!("invalid {name} percentage {value}"));
+    }
+    if !whole.chars().all(|c| c.is_ascii_digit()) || !fraction.chars().all(|c| c.is_ascii_digit()) {
+        return Err(anyhow!("invalid {name} percentage {value}"));
+    }
+    if fraction.len() > 4 {
+        return Err(anyhow!(
+            "{name} percentage {value} has more than 4 decimal places"
+        ));
+    }
+
+    let whole_units = if whole.is_empty() {
+        0
+    } else {
+        whole
+            .parse::<u128>()
+            .map_err(|err| anyhow!("invalid {name} percentage {value}: {err}"))?
+            .checked_mul(PERCENT_UNITS_PER_ONE_PERCENT)
+            .ok_or_else(|| anyhow!("{name} percentage {value} overflows"))?
+    };
+    let mut fraction_padded = fraction.to_string();
+    while fraction_padded.len() < 4 {
+        fraction_padded.push('0');
+    }
+    let fraction_units = if fraction_padded.is_empty() {
+        0
+    } else {
+        fraction_padded
+            .parse::<u128>()
+            .map_err(|err| anyhow!("invalid {name} percentage {value}: {err}"))?
+    };
+    let units = whole_units
+        .checked_add(fraction_units)
+        .ok_or_else(|| anyhow!("{name} percentage {value} overflows"))?;
+    if units > PERCENT_SCALE {
+        return Err(anyhow!("{name} percentage cannot exceed 100%"));
+    }
+    Ok(units as u32)
+}
+
+fn parse_pool_lst_target_overrides(
+    matches: &clap::ArgMatches,
+) -> Result<Vec<PoolLstTargetOverride>> {
+    let Some(values) = matches.get_many::<String>("lst-target") else {
+        return Ok(Vec::new());
+    };
+
+    let mut seen = HashSet::new();
+    values
+        .map(|value| {
+            let (mint, percent) = value
+                .split_once(':')
+                .or_else(|| value.split_once('='))
+                .ok_or_else(|| anyhow!("invalid --lst-target {value}; expected MINT:PERCENT"))?;
+            let mint = parse_pubkey(mint.trim(), "lst-target mint")?;
+            if !seen.insert(mint) {
+                return Err(anyhow!("duplicate --lst-target for mint {mint}"));
+            }
+            Ok(PoolLstTargetOverride {
+                mint,
+                percent: parse_percent_units(percent, "lst-target")?,
+            })
+        })
+        .collect()
+}
+
 fn parse_optional_pubkey_values(
     matches: &clap::ArgMatches,
     name: &str,
@@ -1009,6 +1383,861 @@ fn load_wallet(path: Option<&String>, allow_pubkey: bool) -> Result<Wallet> {
     } else {
         Ok(Wallet::Keypair(Keypair::new()))
     }
+}
+
+async fn compare_price(
+    program: &ProgramClient,
+    pool_id: &Pubkey,
+    wallet: &Wallet,
+    pool: &PoolAccount,
+    matches: &clap::ArgMatches,
+) -> Result<()> {
+    let amounts = parse_compare_amounts(matches)?;
+    let selected_mints = parse_optional_pubkey_values(matches, "mint")?
+        .map(|mints| mints.into_iter().collect::<HashSet<_>>());
+    let allow_disabled_mint = matches.get_flag("allow-disabled-mint");
+    let poll_seconds = matches.get_one::<u64>("poll-seconds").copied();
+    if poll_seconds == Some(0) {
+        return Err(anyhow!("--poll-seconds must be greater than 0"));
+    }
+    let output_file = matches.get_one::<String>("output-file").cloned();
+    let prometheus = matches.get_flag("prometheus");
+    let jupiter = build_jupiter_client(matches, wallet)?;
+    let mut printed_csv_header = false;
+
+    loop {
+        let records = collect_compare_records(
+            &program.rpc(),
+            pool_id,
+            pool,
+            &jupiter,
+            &amounts,
+            selected_mints.as_ref(),
+            allow_disabled_mint,
+        )
+        .await?;
+
+        if let Some(output_file) = output_file.as_deref() {
+            let rendered = if prometheus {
+                render_prometheus_compare_records(pool_id, &records)
+            } else {
+                render_csv_compare_records(&records, true)
+            };
+            fs::write(output_file, rendered)
+                .map_err(|err| anyhow!("failed to write compare output to {output_file}: {err}"))?;
+        } else if prometheus {
+            print!("{}", render_prometheus_compare_records(pool_id, &records));
+            io::stdout().flush()?;
+        } else {
+            let include_header = !printed_csv_header;
+            let rendered = render_csv_compare_records(&records, include_header);
+            printed_csv_header = true;
+            print!("{rendered}");
+            io::stdout().flush()?;
+        }
+
+        let Some(seconds) = poll_seconds else {
+            break;
+        };
+        tokio::time::sleep(Duration::from_secs(seconds)).await;
+    }
+
+    Ok(())
+}
+
+fn parse_compare_amounts(matches: &clap::ArgMatches) -> Result<Vec<u64>> {
+    let amounts = if let Some(values) = matches.get_many::<String>("amount-sol") {
+        values
+            .map(|value| parse_sol_lamports(value))
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        DEFAULT_COMPARE_SOL_LAMPORTS.to_vec()
+    };
+
+    if amounts.is_empty() {
+        return Err(anyhow!("at least one --amount-sol value is required"));
+    }
+    Ok(amounts)
+}
+
+fn parse_sol_lamports(value: &str) -> Result<u64> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("SOL amount cannot be empty"));
+    }
+    if trimmed.starts_with('-') {
+        return Err(anyhow!("SOL amount must be positive"));
+    }
+
+    let (whole, fraction) = trimmed
+        .split_once('.')
+        .map_or((trimmed, ""), |(whole, fraction)| (whole, fraction));
+    if whole.is_empty() && fraction.is_empty() {
+        return Err(anyhow!("invalid SOL amount {value}"));
+    }
+    if !whole.chars().all(|c| c.is_ascii_digit()) || !fraction.chars().all(|c| c.is_ascii_digit()) {
+        return Err(anyhow!("invalid SOL amount {value}"));
+    }
+    if fraction.len() > 9 {
+        return Err(anyhow!("SOL amount {value} has more than 9 decimal places"));
+    }
+
+    let whole_lamports = if whole.is_empty() {
+        0
+    } else {
+        whole
+            .parse::<u64>()
+            .map_err(|err| anyhow!("invalid SOL amount {value}: {err}"))?
+            .checked_mul(LAMPORTS_PER_SOL)
+            .ok_or_else(|| anyhow!("SOL amount {value} overflows u64 lamports"))?
+    };
+    let mut fraction_padded = fraction.to_string();
+    while fraction_padded.len() < 9 {
+        fraction_padded.push('0');
+    }
+    let fractional_lamports = if fraction_padded.is_empty() {
+        0
+    } else {
+        fraction_padded
+            .parse::<u64>()
+            .map_err(|err| anyhow!("invalid SOL amount {value}: {err}"))?
+    };
+    let lamports = whole_lamports
+        .checked_add(fractional_lamports)
+        .ok_or_else(|| anyhow!("SOL amount {value} overflows u64 lamports"))?;
+    if lamports == 0 {
+        return Err(anyhow!("SOL amount must be greater than 0"));
+    }
+    Ok(lamports)
+}
+
+fn build_jupiter_client(matches: &clap::ArgMatches, wallet: &Wallet) -> Result<JupiterBuildClient> {
+    let timeout_seconds = *matches.get_one::<u64>("jupiter-timeout-seconds").unwrap();
+    if timeout_seconds == 0 {
+        return Err(anyhow!("--jupiter-timeout-seconds must be greater than 0"));
+    }
+    let api_key = matches
+        .get_one::<String>("jupiter-api-key")
+        .cloned()
+        .or_else(|| env::var("JUPITER_API_KEY").ok())
+        .filter(|key| !key.trim().is_empty());
+    let request_delay = matches
+        .get_one::<u64>("jupiter-request-delay-ms")
+        .copied()
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| {
+            if api_key.is_some() {
+                Duration::from_millis(1_100)
+            } else {
+                Duration::from_millis(2_200)
+            }
+        });
+    let max_retries = *matches.get_one::<u64>("jupiter-retries").unwrap();
+    let excluded_dexes = matches
+        .get_many::<String>("exclude-dex")
+        .map(|values| {
+            values
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| value.trim().to_string())
+                .collect::<Vec<_>>()
+        })
+        .filter(|values| !values.is_empty())
+        .unwrap_or_else(|| vec![DEFAULT_JUPITER_EXCLUDED_DEX.to_string()]);
+    let taker = if let Some(taker) = matches.get_one::<String>("jupiter-taker") {
+        parse_pubkey(taker, "jupiter-taker")?
+    } else {
+        wallet.pubkey()
+    };
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(timeout_seconds))
+        .build()?;
+
+    Ok(JupiterBuildClient {
+        http,
+        base_url: matches.get_one::<String>("jupiter-url").unwrap().clone(),
+        api_key,
+        excluded_dexes,
+        taker,
+        request_delay,
+        max_retries,
+    })
+}
+
+async fn collect_compare_records(
+    rpc: &RpcClient,
+    pool_id: &Pubkey,
+    pool: &PoolAccount,
+    jupiter: &JupiterBuildClient,
+    amounts: &[u64],
+    selected_mints: Option<&HashSet<Pubkey>>,
+    allow_disabled_mint: bool,
+) -> Result<Vec<CompareRecord>> {
+    let timestamp_unix = unix_timestamp();
+    let epoch_progress = get_epoch_progress(rpc).await?;
+    check_epoch_progress(rpc, pool.max_epoch_progress_pct).await?;
+    check_inventory_summary_ready_for_trade(rpc, pool_id).await?;
+
+    let mut entries = list_lst_infos(rpc, pool_id)
+        .await?
+        .into_iter()
+        .filter(|(_, entry)| include_compare_lst_entry(entry, selected_mints, allow_disabled_mint))
+        .collect_vec();
+    entries.sort_by_key(|(_, entry)| entry.mint);
+
+    if entries.is_empty() {
+        return Err(if allow_disabled_mint {
+            anyhow!("no enabled or explicitly allowed disabled v3 LST entries matched")
+        } else {
+            anyhow!("no enabled v3 LST entries matched")
+        });
+    }
+
+    let mut records = Vec::new();
+    for (_lst_info_address, lst_info) in entries {
+        let stake_pool_state = match fetch_stake_pool_state(rpc, &lst_info.stake_pool).await {
+            Ok(stake_pool_state) => stake_pool_state,
+            Err(err) => {
+                records.extend(error_records_for_amounts(
+                    timestamp_unix,
+                    *pool_id,
+                    lst_info.mint,
+                    amounts,
+                    format!("stake-pool: {err}"),
+                ));
+                continue;
+            }
+        };
+
+        let mint_precheck = validate_compare_mint(rpc, pool, &lst_info, &stake_pool_state).await;
+        if let Err(err) = mint_precheck {
+            records.extend(error_records_for_amounts(
+                timestamp_unix,
+                *pool_id,
+                lst_info.mint,
+                amounts,
+                format!("v3-precheck: {err}"),
+            ));
+            continue;
+        }
+
+        for amount in amounts {
+            records.push(
+                compare_sol_to_lst(
+                    timestamp_unix,
+                    pool_id,
+                    pool,
+                    jupiter,
+                    &lst_info,
+                    &stake_pool_state,
+                    *amount,
+                    epoch_progress,
+                )
+                .await,
+            );
+            records.push(
+                compare_lst_to_sol(
+                    timestamp_unix,
+                    pool_id,
+                    pool,
+                    jupiter,
+                    &lst_info,
+                    &stake_pool_state,
+                    *amount,
+                    epoch_progress,
+                )
+                .await,
+            );
+        }
+    }
+
+    Ok(records)
+}
+
+fn include_compare_lst_entry(
+    entry: &LstInfoAccount,
+    selected_mints: Option<&HashSet<Pubkey>>,
+    allow_disabled_mint: bool,
+) -> bool {
+    let selected = selected_mints
+        .map(|selected| selected.contains(&entry.mint))
+        .unwrap_or(true);
+    if !selected {
+        return false;
+    }
+
+    entry.enabled || (allow_disabled_mint && selected_mints.is_some())
+}
+
+async fn validate_compare_mint(
+    rpc: &RpcClient,
+    pool: &PoolAccount,
+    lst_info: &LstInfoAccount,
+    stake_pool_state: &StakePool,
+) -> Result<()> {
+    if stake_pool_state.pool_mint != lst_info.mint {
+        return Err(anyhow!(
+            "LstInfo mint {} does not match stake pool mint {}",
+            lst_info.mint,
+            stake_pool_state.pool_mint
+        ));
+    }
+    validate_stake_pool_for_v3_quote(rpc, stake_pool_state).await?;
+    check_lst_rate_drift_for_info(pool, lst_info, stake_pool_state)?;
+    Ok(())
+}
+
+async fn compare_sol_to_lst(
+    timestamp_unix: u64,
+    pool_id: &Pubkey,
+    pool: &PoolAccount,
+    jupiter: &JupiterBuildClient,
+    lst_info: &LstInfoAccount,
+    stake_pool_state: &StakePool,
+    notional_sol_lamports: u64,
+    epoch_progress: u64,
+) -> CompareRecord {
+    let sol_mint = spl_token::native_mint::id();
+    let jupiter_quote = match jupiter
+        .quote(&sol_mint, &lst_info.mint, notional_sol_lamports)
+        .await
+    {
+        Ok(quote) => quote,
+        Err(err) => {
+            return error_record(
+                timestamp_unix,
+                *pool_id,
+                lst_info.mint,
+                CompareDirection::SolToLst,
+                notional_sol_lamports,
+                format!("jupiter: {err}"),
+            )
+        }
+    };
+
+    if let Err(err) = reject_excluded_jupiter_route(&jupiter_quote, &jupiter.excluded_dexes) {
+        return error_record(
+            timestamp_unix,
+            *pool_id,
+            lst_info.mint,
+            CompareDirection::SolToLst,
+            notional_sol_lamports,
+            err.to_string(),
+        );
+    }
+    if jupiter_quote.out_amount == 0 {
+        return error_record(
+            timestamp_unix,
+            *pool_id,
+            lst_info.mint,
+            CompareDirection::SolToLst,
+            notional_sol_lamports,
+            "jupiter returned zero LST output".to_string(),
+        );
+    }
+
+    let v3_quote = match calculate_protocol_buy_quote(
+        pool,
+        stake_pool_state,
+        jupiter_quote.out_amount,
+        epoch_progress,
+    ) {
+        Ok(quote) => quote,
+        Err(err) => {
+            return error_record(
+                timestamp_unix,
+                *pool_id,
+                lst_info.mint,
+                CompareDirection::SolToLst,
+                notional_sol_lamports,
+                format!("v3-buy: {err}"),
+            )
+        }
+    };
+
+    let advantage_lamports = i128::from(jupiter_quote.in_amount) - i128::from(v3_quote.total_cost);
+    CompareRecord {
+        timestamp_unix,
+        pool: *pool_id,
+        mint: lst_info.mint,
+        direction: CompareDirection::SolToLst,
+        notional_sol_lamports,
+        lst_amount: Some(jupiter_quote.out_amount),
+        jupiter_sol_lamports: Some(jupiter_quote.in_amount),
+        jupiter_lst_amount: Some(jupiter_quote.out_amount),
+        v3_sol_lamports: Some(v3_quote.total_cost),
+        v3_lst_amount: Some(jupiter_quote.out_amount),
+        v3_advantage_lamports: Some(advantage_lamports),
+        v3_advantage_bps: advantage_bps(advantage_lamports, jupiter_quote.in_amount),
+        jupiter_route: jupiter_quote.route_labels,
+        error: None,
+    }
+}
+
+async fn compare_lst_to_sol(
+    timestamp_unix: u64,
+    pool_id: &Pubkey,
+    pool: &PoolAccount,
+    jupiter: &JupiterBuildClient,
+    lst_info: &LstInfoAccount,
+    stake_pool_state: &StakePool,
+    notional_sol_lamports: u64,
+    epoch_progress: u64,
+) -> CompareRecord {
+    let lst_amount = match calculate_lst_amount_for_sol_value(
+        notional_sol_lamports,
+        stake_pool_state,
+        pool.expected_inflation_per_epoch,
+        epoch_progress,
+    ) {
+        Ok(amount) if amount > 0 => amount,
+        Ok(_) => {
+            return error_record(
+                timestamp_unix,
+                *pool_id,
+                lst_info.mint,
+                CompareDirection::LstToSol,
+                notional_sol_lamports,
+                "notional SOL amount converts to zero LST tokens".to_string(),
+            )
+        }
+        Err(err) => {
+            return error_record(
+                timestamp_unix,
+                *pool_id,
+                lst_info.mint,
+                CompareDirection::LstToSol,
+                notional_sol_lamports,
+                format!("lst-amount: {err}"),
+            )
+        }
+    };
+
+    let sol_mint = spl_token::native_mint::id();
+    let jupiter_quote = match jupiter.quote(&lst_info.mint, &sol_mint, lst_amount).await {
+        Ok(quote) => quote,
+        Err(err) => {
+            return error_record(
+                timestamp_unix,
+                *pool_id,
+                lst_info.mint,
+                CompareDirection::LstToSol,
+                notional_sol_lamports,
+                format!("jupiter: {err}"),
+            )
+        }
+    };
+    if let Err(err) = reject_excluded_jupiter_route(&jupiter_quote, &jupiter.excluded_dexes) {
+        return error_record(
+            timestamp_unix,
+            *pool_id,
+            lst_info.mint,
+            CompareDirection::LstToSol,
+            notional_sol_lamports,
+            err.to_string(),
+        );
+    }
+
+    let v3_quote = match calculate_sell_quote(pool, stake_pool_state, lst_amount, epoch_progress) {
+        Ok(quote) => quote,
+        Err(err) => {
+            return error_record(
+                timestamp_unix,
+                *pool_id,
+                lst_info.mint,
+                CompareDirection::LstToSol,
+                notional_sol_lamports,
+                format!("v3-sell: {err}"),
+            )
+        }
+    };
+    let advantage_lamports =
+        i128::from(v3_quote.amount_to_user) - i128::from(jupiter_quote.out_amount);
+
+    CompareRecord {
+        timestamp_unix,
+        pool: *pool_id,
+        mint: lst_info.mint,
+        direction: CompareDirection::LstToSol,
+        notional_sol_lamports,
+        lst_amount: Some(lst_amount),
+        jupiter_sol_lamports: Some(jupiter_quote.out_amount),
+        jupiter_lst_amount: Some(jupiter_quote.in_amount),
+        v3_sol_lamports: Some(v3_quote.amount_to_user),
+        v3_lst_amount: Some(lst_amount),
+        v3_advantage_lamports: Some(advantage_lamports),
+        v3_advantage_bps: advantage_bps(advantage_lamports, jupiter_quote.out_amount),
+        jupiter_route: jupiter_quote.route_labels,
+        error: None,
+    }
+}
+
+impl JupiterBuildClient {
+    async fn quote(
+        &self,
+        input_mint: &Pubkey,
+        output_mint: &Pubkey,
+        amount: u64,
+    ) -> Result<JupiterQuote> {
+        let mut params = vec![
+            ("inputMint", input_mint.to_string()),
+            ("outputMint", output_mint.to_string()),
+            ("amount", amount.to_string()),
+            ("taker", self.taker.to_string()),
+        ];
+        if !self.excluded_dexes.is_empty() {
+            params.push(("excludeDexes", self.excluded_dexes.join(",")));
+        }
+
+        let response = self.send_quote_request(&params).await?;
+        let response = response
+            .json::<JupiterBuildQuoteResponse>()
+            .await
+            .map_err(|err| anyhow!("failed to decode Jupiter build response: {err}"))?;
+        if self.request_delay > Duration::ZERO {
+            tokio::time::sleep(self.request_delay).await;
+        }
+
+        Ok(JupiterQuote {
+            in_amount: parse_jupiter_u64(&response.in_amount, "inAmount")?,
+            out_amount: parse_jupiter_u64(&response.out_amount, "outAmount")?,
+            route_labels: response
+                .route_plan
+                .into_iter()
+                .map(|step| step.swap_info.label)
+                .collect(),
+        })
+    }
+
+    async fn send_quote_request(&self, params: &[(&str, String)]) -> Result<reqwest::Response> {
+        for attempt in 0..=self.max_retries {
+            let mut request = self.http.get(&self.base_url).query(params);
+            if let Some(api_key) = self.api_key.as_ref() {
+                request = request.header("x-api-key", api_key);
+            }
+            let response = request
+                .send()
+                .await
+                .map_err(|err| anyhow!("Jupiter build request failed: {err}"))?;
+            let status = response.status();
+            if status.is_success() {
+                return Ok(response);
+            }
+            if status.as_u16() == 429 && attempt < self.max_retries {
+                let delay = retry_after_delay(response.headers(), self.request_delay);
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|err| format!("failed to read response body: {err}"));
+            return Err(anyhow!("Jupiter build returned {status}: {body}"));
+        }
+
+        Err(anyhow!("Jupiter build retries exhausted"))
+    }
+}
+
+fn parse_jupiter_u64(value: &str, name: &str) -> Result<u64> {
+    value
+        .parse::<u64>()
+        .map_err(|err| anyhow!("invalid Jupiter {name} {value}: {err}"))
+}
+
+fn retry_after_delay(headers: &reqwest::header::HeaderMap, fallback: Duration) -> Duration {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(fallback.max(Duration::from_millis(1_000)))
+}
+
+fn reject_excluded_jupiter_route(quote: &JupiterQuote, excluded_dexes: &[String]) -> Result<()> {
+    for label in &quote.route_labels {
+        if excluded_dexes
+            .iter()
+            .any(|excluded| label.eq_ignore_ascii_case(excluded))
+        {
+            return Err(anyhow!(
+                "Jupiter route still contains excluded DEX label {label}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn fetch_stake_pool_state(rpc: &RpcClient, stake_pool: &Pubkey) -> Result<StakePool> {
+    let account = rpc
+        .get_account(stake_pool)
+        .await
+        .map_err(|err| anyhow!("failed to fetch stake pool {stake_pool}: {err}"))?;
+    let mut data = account.data.as_slice();
+    StakePool::deserialize(&mut data)
+        .map_err(|err| anyhow!("failed to deserialize stake pool {stake_pool}: {err}"))
+}
+
+fn calculate_lst_amount_for_sol_value(
+    sol_lamports: u64,
+    stake_pool_state: &StakePool,
+    expected_inflation_per_epoch: u32,
+    epoch_progress: u64,
+) -> Result<u64> {
+    calculate_lst_amount_for_sol_value_parts(
+        sol_lamports,
+        stake_pool_state.total_lamports,
+        stake_pool_state.pool_token_supply,
+        expected_inflation_per_epoch,
+        epoch_progress,
+    )
+}
+
+fn calculate_lst_amount_for_sol_value_parts(
+    sol_lamports: u64,
+    total_lamports: u64,
+    pool_token_supply: u64,
+    expected_inflation_per_epoch: u32,
+    epoch_progress: u64,
+) -> Result<u64> {
+    if total_lamports == 0 {
+        return Err(anyhow!("stake pool total lamports is zero"));
+    }
+    if pool_token_supply == 0 {
+        return Err(anyhow!("stake pool token supply is zero"));
+    }
+    let multiplier = calculate_inflation_multiplier(epoch_progress, expected_inflation_per_epoch)?;
+    Ok(u64::try_from(
+        u128::from(sol_lamports)
+            .checked_mul(u128::from(pool_token_supply))
+            .ok_or_else(|| anyhow!("LST amount overflow"))?
+            .checked_mul(u128::from(INFLATION_PCT_DIVISOR))
+            .ok_or_else(|| anyhow!("LST amount overflow"))?
+            .checked_div(u128::from(total_lamports))
+            .ok_or_else(|| anyhow!("LST amount underflow"))?
+            .checked_div(u128::from(multiplier))
+            .ok_or_else(|| anyhow!("LST amount underflow"))?,
+    )
+    .map_err(|_| anyhow!("LST amount overflow"))?)
+}
+
+fn error_records_for_amounts(
+    timestamp_unix: u64,
+    pool: Pubkey,
+    mint: Pubkey,
+    amounts: &[u64],
+    error: String,
+) -> Vec<CompareRecord> {
+    amounts
+        .iter()
+        .flat_map(|amount| {
+            [
+                error_record(
+                    timestamp_unix,
+                    pool,
+                    mint,
+                    CompareDirection::SolToLst,
+                    *amount,
+                    error.clone(),
+                ),
+                error_record(
+                    timestamp_unix,
+                    pool,
+                    mint,
+                    CompareDirection::LstToSol,
+                    *amount,
+                    error.clone(),
+                ),
+            ]
+        })
+        .collect()
+}
+
+fn error_record(
+    timestamp_unix: u64,
+    pool: Pubkey,
+    mint: Pubkey,
+    direction: CompareDirection,
+    notional_sol_lamports: u64,
+    error: String,
+) -> CompareRecord {
+    CompareRecord {
+        timestamp_unix,
+        pool,
+        mint,
+        direction,
+        notional_sol_lamports,
+        lst_amount: None,
+        jupiter_sol_lamports: None,
+        jupiter_lst_amount: None,
+        v3_sol_lamports: None,
+        v3_lst_amount: None,
+        v3_advantage_lamports: None,
+        v3_advantage_bps: None,
+        jupiter_route: Vec::new(),
+        error: Some(error),
+    }
+}
+
+fn advantage_bps(advantage_lamports: i128, baseline_lamports: u64) -> Option<f64> {
+    if baseline_lamports == 0 {
+        return None;
+    }
+    Some((advantage_lamports as f64) * 10_000.0 / (baseline_lamports as f64))
+}
+
+fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn render_csv_compare_records(records: &[CompareRecord], include_header: bool) -> String {
+    let mut output = String::new();
+    if include_header {
+        output.push_str(csv_compare_header());
+    }
+    for record in records {
+        output.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            record.timestamp_unix,
+            record.pool,
+            record.mint,
+            record.direction.label(),
+            format_lamports_as_sol(record.notional_sol_lamports as u128),
+            record.notional_sol_lamports,
+            optional_u64_csv(record.lst_amount),
+            optional_u64_csv(record.jupiter_sol_lamports),
+            optional_u64_csv(record.jupiter_lst_amount),
+            optional_u64_csv(record.v3_sol_lamports),
+            optional_u64_csv(record.v3_lst_amount),
+            optional_i128_csv(record.v3_advantage_lamports),
+            optional_f64_csv(record.v3_advantage_bps),
+            csv_escape(&record.jupiter_route.join(">")),
+            if record.success() { "ok" } else { "error" },
+            csv_escape(record.error.as_deref().unwrap_or("")),
+            optional_bool_csv(unstake_pool_better(record)),
+        ));
+    }
+    output
+}
+
+fn csv_compare_header() -> &'static str {
+    "timestamp,pool,mint,direction,notional_sol,notional_sol_lamports,lst_amount,jupiter_sol_lamports,jupiter_lst_amount,v3_sol_lamports,v3_lst_amount,v3_advantage_lamports,v3_advantage_bps,jupiter_route,status,error,unstake_pool_better\n"
+}
+
+fn render_prometheus_compare_records(pool_id: &Pubkey, records: &[CompareRecord]) -> String {
+    let mut output = String::new();
+    output.push_str("# HELP liquid_unstaker_compare_quote_success 1 when a compare quote row succeeded, 0 when it failed.\n");
+    output.push_str("# TYPE liquid_unstaker_compare_quote_success gauge\n");
+    output.push_str("# HELP liquid_unstaker_compare_v3_advantage_lamports Positive when the v3 pool is better than Jupiter excluding the liquid unstaker route.\n");
+    output.push_str("# TYPE liquid_unstaker_compare_v3_advantage_lamports gauge\n");
+    output.push_str("# HELP liquid_unstaker_compare_v3_advantage_bps Positive basis-point advantage when the v3 pool is better than Jupiter excluding the liquid unstaker route.\n");
+    output.push_str("# TYPE liquid_unstaker_compare_v3_advantage_bps gauge\n");
+    output.push_str("# HELP liquid_unstaker_compare_jupiter_sol_lamports Jupiter SOL-side quote amount in lamports.\n");
+    output.push_str("# TYPE liquid_unstaker_compare_jupiter_sol_lamports gauge\n");
+    output.push_str(
+        "# HELP liquid_unstaker_compare_v3_sol_lamports V3 SOL-side quote amount in lamports.\n",
+    );
+    output.push_str("# TYPE liquid_unstaker_compare_v3_sol_lamports gauge\n");
+    output.push_str(
+        "# HELP liquid_unstaker_compare_lst_amount LST token amount used for the comparison row.\n",
+    );
+    output.push_str("# TYPE liquid_unstaker_compare_lst_amount gauge\n");
+    output.push_str("# HELP liquid_unstaker_compare_last_run_unixtime Unix timestamp of the latest rendered comparison snapshot.\n");
+    output.push_str("# TYPE liquid_unstaker_compare_last_run_unixtime gauge\n");
+
+    let latest_timestamp = records
+        .iter()
+        .map(|record| record.timestamp_unix)
+        .max()
+        .unwrap_or_else(unix_timestamp);
+    output.push_str(&format!(
+        "liquid_unstaker_compare_last_run_unixtime{{pool=\"{}\"}} {}\n",
+        prom_escape_label(&pool_id.to_string()),
+        latest_timestamp
+    ));
+
+    for record in records {
+        let labels = prometheus_record_labels(record);
+        output.push_str(&format!(
+            "liquid_unstaker_compare_quote_success{{{labels}}} {}\n",
+            if record.success() { 1 } else { 0 }
+        ));
+        if let Some(value) = record.v3_advantage_lamports {
+            output.push_str(&format!(
+                "liquid_unstaker_compare_v3_advantage_lamports{{{labels}}} {value}\n",
+            ));
+        }
+        if let Some(value) = record.v3_advantage_bps {
+            output.push_str(&format!(
+                "liquid_unstaker_compare_v3_advantage_bps{{{labels}}} {value:.9}\n",
+            ));
+        }
+        if let Some(value) = record.jupiter_sol_lamports {
+            output.push_str(&format!(
+                "liquid_unstaker_compare_jupiter_sol_lamports{{{labels}}} {value}\n",
+            ));
+        }
+        if let Some(value) = record.v3_sol_lamports {
+            output.push_str(&format!(
+                "liquid_unstaker_compare_v3_sol_lamports{{{labels}}} {value}\n",
+            ));
+        }
+        if let Some(value) = record.lst_amount {
+            output.push_str(&format!(
+                "liquid_unstaker_compare_lst_amount{{{labels}}} {value}\n",
+            ));
+        }
+    }
+
+    output
+}
+
+fn prometheus_record_labels(record: &CompareRecord) -> String {
+    format!(
+        "pool=\"{}\",mint=\"{}\",direction=\"{}\",notional_lamports=\"{}\",notional_sol=\"{}\"",
+        prom_escape_label(&record.pool.to_string()),
+        prom_escape_label(&record.mint.to_string()),
+        record.direction.label(),
+        record.notional_sol_lamports,
+        format_lamports_as_sol(record.notional_sol_lamports as u128),
+    )
+}
+
+fn optional_u64_csv(value: Option<u64>) -> String {
+    value.map(|value| value.to_string()).unwrap_or_default()
+}
+
+fn optional_i128_csv(value: Option<i128>) -> String {
+    value.map(|value| value.to_string()).unwrap_or_default()
+}
+
+fn optional_f64_csv(value: Option<f64>) -> String {
+    value.map(|value| format!("{value:.9}")).unwrap_or_default()
+}
+
+fn optional_bool_csv(value: Option<bool>) -> String {
+    value.map(|value| value.to_string()).unwrap_or_default()
+}
+
+fn unstake_pool_better(record: &CompareRecord) -> Option<bool> {
+    record.v3_advantage_lamports.map(|advantage| advantage > 0)
+}
+
+fn csv_escape(value: &str) -> String {
+    if value.contains(',') || value.contains('"') || value.contains('\n') || value.contains('\r') {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
+fn prom_escape_label(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('\n', "\\n")
+        .replace('"', "\\\"")
 }
 
 async fn fetch_pool(program: &ProgramClient, pool: Pubkey) -> Result<PoolAccount> {
@@ -2300,6 +3529,484 @@ async fn stake_account_infos_for_update(
     Ok(entries)
 }
 
+async fn unstake_pool_lsts_balanced(
+    program: &ProgramClient,
+    pool_id: &Pubkey,
+    wallet: &Wallet,
+    pool: &PoolAccount,
+    cap_percent: u32,
+    overrides: &[PoolLstTargetOverride],
+    stake_account_seed: Option<u64>,
+    simulate: bool,
+) -> Result<()> {
+    let epoch_progress = get_epoch_progress(&program.rpc()).await?;
+    let positions = list_pool_lst_position_snapshots(
+        &program.rpc(),
+        pool_id,
+        pool.expected_inflation_per_epoch,
+        epoch_progress,
+    )
+    .await?;
+    if positions.is_empty() {
+        println!("No pool-owned LST balances found");
+        return Ok(());
+    }
+    let minimum_unstake_lamports =
+        spl_stake_pool::minimum_delegation(program.rpc().get_stake_minimum_delegation().await?);
+
+    let plan = build_balanced_pool_lst_plan(
+        pool.sol_vault_lamports,
+        pool.total_deactivating_stake,
+        pool.expected_inflation_per_epoch,
+        epoch_progress,
+        cap_percent,
+        minimum_unstake_lamports,
+        positions,
+        overrides,
+    )?;
+    if let Some(message) = balanced_pool_lst_skip_message(&plan) {
+        println!("{message}");
+        return Ok(());
+    }
+    print_balanced_pool_lst_plan(&plan);
+
+    let requests = plan
+        .positions
+        .iter()
+        .filter(|position| position.unstake_amount > 0)
+        .map(|position| PoolLstUnstakeRequest {
+            mint: position.mint,
+            amount: position.unstake_amount,
+            stake_pool_program_id: Some(position.stake_pool_program_id),
+        })
+        .collect_vec();
+
+    if requests.is_empty() {
+        println!("No pool-owned LST balances need unstaking for this plan");
+        return Ok(());
+    }
+
+    execute_pool_lst_unstake_requests(
+        program,
+        pool_id,
+        wallet,
+        requests,
+        stake_account_seed,
+        simulate,
+    )
+    .await
+}
+
+async fn list_pool_lst_position_snapshots(
+    rpc: &RpcClient,
+    pool_id: &Pubkey,
+    expected_inflation_per_epoch: u32,
+    epoch_progress: u64,
+) -> Result<Vec<PoolLstPositionSnapshot>> {
+    let balances = list_pool_lst_balances(rpc, pool_id).await?;
+    let mut positions = Vec::with_capacity(balances.len());
+
+    for (mint, amount) in balances {
+        let (stake_pool_program_id, (_stake_pool_address, stake_pool_state)) =
+            get_stake_pool_for_mint_from_supported_programs(rpc, &mint).await?;
+        let sol_value = calculate_lst_sol_value(
+            amount,
+            stake_pool_state.total_lamports,
+            stake_pool_state.pool_token_supply,
+            epoch_progress,
+            expected_inflation_per_epoch,
+        )?;
+        positions.push(PoolLstPositionSnapshot {
+            mint,
+            amount,
+            sol_value,
+            stake_pool_program_id,
+            stake_pool_total_lamports: stake_pool_state.total_lamports,
+            stake_pool_token_supply: stake_pool_state.pool_token_supply,
+            stake_withdrawal_fee: stake_pool_state.stake_withdrawal_fee,
+        });
+    }
+
+    positions.sort_by_key(|position| position.mint);
+    Ok(positions)
+}
+
+fn build_balanced_pool_lst_plan(
+    sol_vault_lamports: u64,
+    total_deactivating_stake_lamports: u64,
+    expected_inflation_per_epoch: u32,
+    epoch_progress: u64,
+    cap_percent: u32,
+    minimum_unstake_lamports: u64,
+    positions: Vec<PoolLstPositionSnapshot>,
+    overrides: &[PoolLstTargetOverride],
+) -> Result<BalancedPoolLstPlan> {
+    let positions_by_mint = positions
+        .iter()
+        .map(|position| (position.mint, position))
+        .collect::<HashMap<_, _>>();
+    let mut override_targets = HashMap::new();
+    for override_target in overrides {
+        let position = positions_by_mint
+            .get(&override_target.mint)
+            .ok_or_else(|| {
+                anyhow!(
+                    "--lst-target supplied mint {} but the pool owns no tokens for that mint",
+                    override_target.mint
+                )
+            })?;
+        let inserted = override_targets
+            .insert(override_target.mint, override_target.percent)
+            .is_none();
+        if !inserted {
+            return Err(anyhow!(
+                "duplicate --lst-target for mint {}",
+                override_target.mint
+            ));
+        }
+        if position.sol_value == 0 && override_target.percent > 0 {
+            return Err(anyhow!(
+                "LST {} has zero SOL value, cannot apply a positive target",
+                override_target.mint
+            ));
+        }
+    }
+
+    let current_lst_value_lamports = positions.iter().try_fold(0_u128, |total, position| {
+        total
+            .checked_add(u128::from(position.sol_value))
+            .ok_or_else(|| anyhow!("LST value overflow"))
+    })?;
+    let tvl_lamports = u128::from(sol_vault_lamports)
+        .checked_add(u128::from(total_deactivating_stake_lamports))
+        .ok_or_else(|| anyhow!("pool TVL overflow"))?
+        .checked_add(current_lst_value_lamports)
+        .ok_or_else(|| anyhow!("pool TVL overflow"))?;
+    let target_lst_value_lamports = percent_of_u128(tvl_lamports, cap_percent)?;
+    let trigger_percent = cap_percent
+        .checked_add(BALANCED_LST_CAP_TRIGGER_BUFFER_PERCENT)
+        .map(|percent| percent.min(PERCENT_SCALE as u32))
+        .ok_or_else(|| anyhow!("balanced LST cap trigger percentage overflow"))?;
+    let trigger_lst_value_lamports = percent_of_u128(tvl_lamports, trigger_percent)?;
+    let global_reduction_needed = current_lst_value_lamports > trigger_lst_value_lamports;
+
+    let mut fixed_target_values = HashMap::<Pubkey, u128>::new();
+    let mut fixed_target_sum = 0_u128;
+    for position in &positions {
+        let Some(percent) = override_targets.get(&position.mint).copied() else {
+            continue;
+        };
+        let target_value =
+            percent_of_u128(tvl_lamports, percent)?.min(u128::from(position.sol_value));
+        fixed_target_sum = fixed_target_sum
+            .checked_add(target_value)
+            .ok_or_else(|| anyhow!("override target value overflow"))?;
+        fixed_target_values.insert(position.mint, target_value);
+    }
+
+    if global_reduction_needed && fixed_target_sum > target_lst_value_lamports {
+        return Err(anyhow!(
+            "--lst-target overrides require {} lamports in overridden LSTs, above global LST cap target {} lamports",
+            fixed_target_sum,
+            target_lst_value_lamports
+        ));
+    }
+
+    let non_override_current_value = positions
+        .iter()
+        .filter(|position| !fixed_target_values.contains_key(&position.mint))
+        .try_fold(0_u128, |total, position| {
+            total
+                .checked_add(u128::from(position.sol_value))
+                .ok_or_else(|| anyhow!("non-overridden LST value overflow"))
+        })?;
+    let non_override_target_value = if global_reduction_needed {
+        target_lst_value_lamports
+            .checked_sub(fixed_target_sum)
+            .ok_or_else(|| anyhow!("override target value exceeds global cap"))?
+            .min(non_override_current_value)
+    } else {
+        non_override_current_value
+    };
+
+    let mut plan_positions = Vec::with_capacity(positions.len());
+    let mut new_lst_value_lamports = 0_u128;
+    for position in positions {
+        let mut target_value = if global_reduction_needed {
+            if let Some(target_value) = fixed_target_values.get(&position.mint) {
+                *target_value
+            } else if non_override_current_value > 0 {
+                u128::from(position.sol_value)
+                    .checked_mul(non_override_target_value)
+                    .ok_or_else(|| anyhow!("target value overflow"))?
+                    .checked_div(non_override_current_value)
+                    .ok_or_else(|| anyhow!("target value underflow"))?
+            } else {
+                u128::from(position.sol_value)
+            }
+        } else {
+            u128::from(position.sol_value)
+        }
+        .min(u128::from(position.sol_value));
+        let mut note = None;
+        if global_reduction_needed
+            && target_value > 0
+            && target_value < u128::from(LAMPORTS_PER_SOL)
+        {
+            note = Some("target below 1 SOL; planning full LST unstake".to_string());
+            target_value = 0;
+        }
+
+        let mut target_amount = calculate_position_target_lst_amount(
+            &position,
+            target_value,
+            expected_inflation_per_epoch,
+            epoch_progress,
+        )?;
+        let mut target_sol_value = if target_amount == position.amount {
+            position.sol_value
+        } else {
+            calculate_lst_sol_value(
+                target_amount,
+                position.stake_pool_total_lamports,
+                position.stake_pool_token_supply,
+                epoch_progress,
+                expected_inflation_per_epoch,
+            )?
+        };
+        let mut unstake_amount = position
+            .amount
+            .checked_sub(target_amount)
+            .ok_or_else(|| anyhow!("target amount exceeds current amount"))?;
+        let mut unstake_sol_lamports =
+            calculate_position_unstake_lamports(&position, unstake_amount)?;
+        if unstake_amount > 0 && unstake_sol_lamports < minimum_unstake_lamports {
+            note = Some(format!(
+                "skipped: estimated unstake split {} lamports is below minimum {}",
+                unstake_sol_lamports, minimum_unstake_lamports
+            ));
+            target_amount = position.amount;
+            target_sol_value = position.sol_value;
+            unstake_amount = 0;
+            unstake_sol_lamports = 0;
+        }
+        new_lst_value_lamports = new_lst_value_lamports
+            .checked_add(u128::from(target_sol_value))
+            .ok_or_else(|| anyhow!("new LST value overflow"))?;
+
+        plan_positions.push(BalancedPoolLstPlanPosition {
+            mint: position.mint,
+            current_amount: position.amount,
+            current_sol_value: position.sol_value,
+            current_sol_pct: ratio_percent_units(u128::from(position.sol_value), tvl_lamports),
+            target_amount,
+            target_sol_value,
+            target_sol_pct: ratio_percent_units(u128::from(target_sol_value), tvl_lamports),
+            unstake_amount,
+            unstake_sol_lamports,
+            override_percent: override_targets.get(&position.mint).copied(),
+            stake_pool_program_id: position.stake_pool_program_id,
+            note,
+        });
+    }
+
+    Ok(BalancedPoolLstPlan {
+        cap_percent,
+        trigger_percent,
+        sol_vault_lamports,
+        total_deactivating_stake_lamports,
+        current_lst_value_lamports,
+        target_lst_value_lamports,
+        trigger_lst_value_lamports,
+        new_lst_value_lamports,
+        tvl_lamports,
+        minimum_unstake_lamports,
+        positions: plan_positions,
+    })
+}
+
+fn calculate_position_unstake_lamports(
+    position: &PoolLstPositionSnapshot,
+    unstake_amount: u64,
+) -> Result<u64> {
+    if unstake_amount == 0 {
+        return Ok(0);
+    }
+    if position.stake_pool_token_supply == 0 {
+        return Err(anyhow!("stake pool token supply is zero"));
+    }
+    let fee = position
+        .stake_withdrawal_fee
+        .apply(unstake_amount)
+        .ok_or_else(|| anyhow!("stake withdrawal fee overflow"))?;
+    let fee = u64::try_from(fee).map_err(|_| anyhow!("stake withdrawal fee overflow"))?;
+    let net_amount = unstake_amount
+        .checked_sub(fee)
+        .ok_or_else(|| anyhow!("stake withdrawal fee exceeds unstake amount"))?;
+    let numerator = u128::from(net_amount)
+        .checked_mul(u128::from(position.stake_pool_total_lamports))
+        .ok_or_else(|| anyhow!("stake withdraw lamports overflow"))?;
+    if numerator < u128::from(position.stake_pool_token_supply) {
+        return Ok(0);
+    }
+    Ok(u64::try_from(
+        numerator
+            .checked_div(u128::from(position.stake_pool_token_supply))
+            .ok_or_else(|| anyhow!("stake withdraw lamports underflow"))?,
+    )
+    .map_err(|_| anyhow!("stake withdraw lamports overflow"))?)
+}
+
+fn calculate_position_target_lst_amount(
+    position: &PoolLstPositionSnapshot,
+    target_sol_value: u128,
+    expected_inflation_per_epoch: u32,
+    epoch_progress: u64,
+) -> Result<u64> {
+    if target_sol_value >= u128::from(position.sol_value) {
+        return Ok(position.amount);
+    }
+    if target_sol_value == 0 {
+        return Ok(0);
+    }
+    let target_sol_value = u64::try_from(target_sol_value)
+        .map_err(|_| anyhow!("target SOL value exceeds u64 lamports"))?;
+    Ok(calculate_lst_amount_for_sol_value_parts(
+        target_sol_value,
+        position.stake_pool_total_lamports,
+        position.stake_pool_token_supply,
+        expected_inflation_per_epoch,
+        epoch_progress,
+    )?
+    .min(position.amount))
+}
+
+fn print_balanced_pool_lst_plan(plan: &BalancedPoolLstPlan) {
+    println!("Pool LST balanced unstake plan");
+    println!(
+        "  sol_vault_lamports={} sol_vault_sol={}",
+        plan.sol_vault_lamports,
+        format_lamports_as_sol(u128::from(plan.sol_vault_lamports))
+    );
+    println!(
+        "  total_deactivating_stake_lamports={} total_deactivating_stake_sol={}",
+        plan.total_deactivating_stake_lamports,
+        format_lamports_as_sol(u128::from(plan.total_deactivating_stake_lamports))
+    );
+    println!(
+        "  current_lst_value_lamports={} current_lst_value_sol={} current_lst_pct={}",
+        plan.current_lst_value_lamports,
+        format_lamports_as_sol(plan.current_lst_value_lamports),
+        format_percent_units(ratio_percent_units(
+            plan.current_lst_value_lamports,
+            plan.tvl_lamports,
+        ))
+    );
+    println!(
+        "  tvl_lamports={} tvl_sol={}",
+        plan.tvl_lamports,
+        format_lamports_as_sol(plan.tvl_lamports)
+    );
+    println!(
+        "  lst_cap_pct={} target_lst_value_lamports={} target_lst_value_sol={}",
+        format_percent_units(plan.cap_percent),
+        plan.target_lst_value_lamports,
+        format_lamports_as_sol(plan.target_lst_value_lamports)
+    );
+    println!(
+        "  lst_trigger_pct={} trigger_lst_value_lamports={} trigger_lst_value_sol={}",
+        format_percent_units(plan.trigger_percent),
+        plan.trigger_lst_value_lamports,
+        format_lamports_as_sol(plan.trigger_lst_value_lamports)
+    );
+    println!(
+        "  minimum_unstake_lamports={} minimum_unstake_sol={}",
+        plan.minimum_unstake_lamports,
+        format_lamports_as_sol(u128::from(plan.minimum_unstake_lamports))
+    );
+    println!(
+        "  planned_new_lst_value_lamports={} planned_new_lst_value_sol={} planned_new_lst_pct={}",
+        plan.new_lst_value_lamports,
+        format_lamports_as_sol(plan.new_lst_value_lamports),
+        format_percent_units(ratio_percent_units(
+            plan.new_lst_value_lamports,
+            plan.tvl_lamports,
+        ))
+    );
+    println!("mint,current_amount,current_sol_lamports,current_sol_pct,new_amount,new_sol_lamports,new_sol_pct,unstake_amount,unstake_sol_lamports,override_pct,note");
+    for position in &plan.positions {
+        println!(
+            "{},{},{},{},{},{},{},{},{},{},{}",
+            position.mint,
+            position.current_amount,
+            position.current_sol_value,
+            format_percent_units(position.current_sol_pct),
+            position.target_amount,
+            position.target_sol_value,
+            format_percent_units(position.target_sol_pct),
+            position.unstake_amount,
+            position.unstake_sol_lamports,
+            position
+                .override_percent
+                .map(format_percent_units)
+                .unwrap_or_default(),
+            csv_escape(position.note.as_deref().unwrap_or(""))
+        );
+    }
+}
+
+fn balanced_pool_lst_skip_message(plan: &BalancedPoolLstPlan) -> Option<String> {
+    if plan.current_lst_value_lamports > plan.trigger_lst_value_lamports {
+        return None;
+    }
+
+    let current_pct = ratio_percent_units(plan.current_lst_value_lamports, plan.tvl_lamports);
+    let comparison = if plan.current_lst_value_lamports < plan.trigger_lst_value_lamports {
+        "less than"
+    } else {
+        "equal to"
+    };
+    Some(format!(
+        "Current LST value {} is {} trigger {}; skipping unstakes",
+        format_percent_units(current_pct),
+        comparison,
+        format_percent_units(plan.trigger_percent)
+    ))
+}
+
+fn percent_of_u128(value: u128, percent: u32) -> Result<u128> {
+    value
+        .checked_mul(u128::from(percent))
+        .ok_or_else(|| anyhow!("percentage calculation overflow"))?
+        .checked_div(PERCENT_SCALE)
+        .ok_or_else(|| anyhow!("percentage calculation underflow"))
+}
+
+fn ratio_percent_units(value: u128, total: u128) -> u32 {
+    if total == 0 {
+        return 0;
+    }
+    value
+        .saturating_mul(PERCENT_SCALE)
+        .checked_div(total)
+        .unwrap_or(PERCENT_SCALE)
+        .min(PERCENT_SCALE) as u32
+}
+
+fn format_percent_units(percent: u32) -> String {
+    let whole = u128::from(percent) / PERCENT_UNITS_PER_ONE_PERCENT;
+    let fraction = u128::from(percent) % PERCENT_UNITS_PER_ONE_PERCENT;
+    if fraction == 0 {
+        return format!("{whole}%");
+    }
+
+    let mut formatted = format!("{whole}.{fraction:04}");
+    while formatted.ends_with('0') {
+        formatted.pop();
+    }
+    format!("{formatted}%")
+}
+
 async fn unstake_pool_lsts_for_selection(
     program: &ProgramClient,
     pool_id: &Pubkey,
@@ -2315,28 +4022,63 @@ async fn unstake_pool_lsts_for_selection(
         mint_selection,
         amount_selection,
     )
-    .await?;
+    .await?
+    .into_iter()
+    .map(|(mint, amount)| PoolLstUnstakeRequest {
+        mint,
+        amount,
+        stake_pool_program_id: None,
+    })
+    .collect_vec();
     if requests.is_empty() {
         println!("No pool-owned LST balances found");
         return Ok(());
     }
 
+    execute_pool_lst_unstake_requests(
+        program,
+        pool_id,
+        wallet,
+        requests,
+        stake_account_seed,
+        simulate,
+    )
+    .await
+}
+
+async fn execute_pool_lst_unstake_requests(
+    program: &ProgramClient,
+    pool_id: &Pubkey,
+    wallet: &Wallet,
+    requests: Vec<PoolLstUnstakeRequest>,
+    stake_account_seed: Option<u64>,
+    simulate: bool,
+) -> Result<()> {
     let mut next_stake_account_seed = stake_account_seed;
-    for (mint, amount) in requests {
+    for request in requests {
         let pool = fetch_pool(program, *pool_id).await?;
         let seed = next_stake_account_seed.unwrap_or(pool.total_deactivating_stake);
-        let (stake_pool_program_id, _) =
-            get_stake_pool_for_mint_from_supported_programs(&program.rpc(), &mint).await?;
+        let stake_pool_program_id =
+            if let Some(stake_pool_program_id) = request.stake_pool_program_id {
+                stake_pool_program_id
+            } else {
+                get_stake_pool_for_mint_from_supported_programs(&program.rpc(), &request.mint)
+                    .await?
+                    .0
+            };
 
-        println!("Unstaking {amount} tokens for mint {mint}");
+        println!(
+            "Unstaking {} tokens for mint {}",
+            request.amount, request.mint
+        );
         let new_stake_account_count = unstake_pool_lsts(
             program,
             pool_id,
             wallet,
             &stake_pool_program_id,
-            &mint,
+            &request.mint,
             &pool,
-            amount,
+            request.amount,
             seed,
             simulate,
         )
@@ -3391,6 +5133,15 @@ async fn quote_sell_lst(
     check_epoch_progress(rpc, pool.max_epoch_progress_pct).await?;
 
     let epoch_progress = get_epoch_progress(rpc).await?;
+    calculate_sell_quote(pool, &stake_pool_state, lst_amount, epoch_progress)
+}
+
+fn calculate_sell_quote(
+    pool: &PoolAccount,
+    stake_pool_state: &StakePool,
+    lst_amount: u64,
+    epoch_progress: u64,
+) -> Result<SellQuote> {
     let total_sol_value = calculate_lst_sol_value(
         lst_amount,
         stake_pool_state.total_lamports,
@@ -3454,36 +5205,12 @@ async fn quote_sell_lst(
     })
 }
 
-async fn quote_buy_lst(
-    program: &ProgramClient,
-    pool_id: &Pubkey,
-    wallet: &Keypair,
+fn calculate_protocol_buy_quote(
     pool: &PoolAccount,
-    mint: &Pubkey,
+    stake_pool_state: &StakePool,
     lst_amount: u64,
-) -> Result<BuyQuote> {
-    let rpc = program.rpc();
-    require_lst_info_for_trade(&rpc, pool_id, mint).await?;
-    let (_, (stake_pool_address, stake_pool_state)) =
-        get_stake_pool_for_mint_from_supported_programs(&rpc, mint).await?;
-    validate_stake_pool_for_v3_quote(&rpc, &stake_pool_state).await?;
-    check_lst_rate_drift(&rpc, pool_id, pool, mint, &stake_pool_state).await?;
-    check_epoch_progress(&rpc, pool.max_epoch_progress_pct).await?;
-
-    let pool_lst_token_account = token_account_address(pool_id, mint);
-    let pool_lst_amount = get_token_account_amount(&rpc, &pool_lst_token_account)
-        .await?
-        .unwrap_or(0);
-    if pool_lst_amount < lst_amount {
-        return Err(anyhow!(
-            "pool owns {} tokens for mint {}, below requested {}",
-            pool_lst_amount,
-            mint,
-            lst_amount
-        ));
-    }
-
-    let epoch_progress = get_epoch_progress(&rpc).await?;
+    epoch_progress: u64,
+) -> Result<ProtocolBuyQuote> {
     let multiplier =
         calculate_inflation_multiplier(epoch_progress, pool.expected_inflation_per_epoch)?;
     let total_sol_value_without_discount = calculate_lst_sol_value(
@@ -3546,6 +5273,51 @@ async fn quote_buy_lst(
             pool.min_buy_lamports
         ));
     }
+
+    Ok(ProtocolBuyQuote {
+        total_sol_value_without_discount,
+        half_stake_pool_fee_pct,
+        lst_cost,
+        dynamic_fee_pct,
+        pool_fee,
+        manager_fee,
+        total_fee,
+        total_cost,
+    })
+}
+
+async fn quote_buy_lst(
+    program: &ProgramClient,
+    pool_id: &Pubkey,
+    wallet: &Keypair,
+    pool: &PoolAccount,
+    mint: &Pubkey,
+    lst_amount: u64,
+) -> Result<BuyQuote> {
+    let rpc = program.rpc();
+    require_lst_info_for_trade(&rpc, pool_id, mint).await?;
+    let (_, (stake_pool_address, stake_pool_state)) =
+        get_stake_pool_for_mint_from_supported_programs(&rpc, mint).await?;
+    validate_stake_pool_for_v3_quote(&rpc, &stake_pool_state).await?;
+    check_lst_rate_drift(&rpc, pool_id, pool, mint, &stake_pool_state).await?;
+    check_epoch_progress(&rpc, pool.max_epoch_progress_pct).await?;
+
+    let pool_lst_token_account = token_account_address(pool_id, mint);
+    let pool_lst_amount = get_token_account_amount(&rpc, &pool_lst_token_account)
+        .await?
+        .unwrap_or(0);
+    if pool_lst_amount < lst_amount {
+        return Err(anyhow!(
+            "pool owns {} tokens for mint {}, below requested {}",
+            pool_lst_amount,
+            mint,
+            lst_amount
+        ));
+    }
+
+    let epoch_progress = get_epoch_progress(&rpc).await?;
+    let protocol_quote =
+        calculate_protocol_buy_quote(pool, &stake_pool_state, lst_amount, epoch_progress)?;
 
     let token_account_rent = rpc
         .get_minimum_balance_for_rent_exemption(spl_token::state::Account::LEN)
@@ -3651,14 +5423,14 @@ async fn quote_buy_lst(
     .await?;
 
     Ok(BuyQuote {
-        total_sol_value_without_discount,
-        half_stake_pool_fee_pct,
-        lst_cost,
-        dynamic_fee_pct,
-        pool_fee,
-        manager_fee,
-        total_fee,
-        total_cost,
+        total_sol_value_without_discount: protocol_quote.total_sol_value_without_discount,
+        half_stake_pool_fee_pct: protocol_quote.half_stake_pool_fee_pct,
+        lst_cost: protocol_quote.lst_cost,
+        dynamic_fee_pct: protocol_quote.dynamic_fee_pct,
+        pool_fee: protocol_quote.pool_fee,
+        manager_fee: protocol_quote.manager_fee,
+        total_fee: protocol_quote.total_fee,
+        total_cost: protocol_quote.total_cost,
         user_wsol_account_rent,
         user_lst_account_rent,
         estimated_transaction_fee,
@@ -3818,13 +5590,16 @@ async fn check_lst_rate_drift(
     stake_pool: &StakePool,
 ) -> Result<()> {
     let lst_info = require_lst_info_for_trade(rpc, pool_id, mint).await?;
-    let current_rate = (stake_pool.total_lamports as u128)
-        .checked_mul(RATE_SCALE)
-        .ok_or_else(|| anyhow!("rate overflow"))?
-        .checked_div(stake_pool.pool_token_supply as u128)
-        .ok_or_else(|| anyhow!("rate underflow"))? as u64;
+    check_lst_rate_drift_for_info(pool, &lst_info, stake_pool)
+}
 
-    if rate_drift_exceeds(&lst_info, current_rate, pool.max_rate_drift_bps) {
+fn check_lst_rate_drift_for_info(
+    pool: &PoolAccount,
+    lst_info: &LstInfoAccount,
+    stake_pool: &StakePool,
+) -> Result<()> {
+    let current_rate = calculate_stake_pool_rate(stake_pool)?;
+    if rate_drift_exceeds(lst_info, current_rate, pool.max_rate_drift_bps) {
         return Err(anyhow!(
             "current LST exchange rate exceeds configured drift cap; run sync-inventory or inspect the stake pool"
         ));
@@ -4528,6 +6303,52 @@ mod tests {
     }
 
     #[test]
+    fn compare_entry_filter_allows_disabled_only_when_explicitly_selected() {
+        let enabled_mint = Pubkey::new_unique();
+        let disabled_mint = Pubkey::new_unique();
+        let enabled_entry = test_lst_info(enabled_mint, true);
+        let disabled_entry = test_lst_info(disabled_mint, false);
+
+        assert!(include_compare_lst_entry(&enabled_entry, None, false));
+        assert!(!include_compare_lst_entry(&disabled_entry, None, false));
+        assert!(!include_compare_lst_entry(&disabled_entry, None, true));
+
+        let selected_disabled = HashSet::from([disabled_mint]);
+        assert!(!include_compare_lst_entry(
+            &disabled_entry,
+            Some(&selected_disabled),
+            false,
+        ));
+        assert!(include_compare_lst_entry(
+            &disabled_entry,
+            Some(&selected_disabled),
+            true,
+        ));
+        assert!(!include_compare_lst_entry(
+            &enabled_entry,
+            Some(&selected_disabled),
+            true,
+        ));
+    }
+
+    fn test_lst_info(mint: Pubkey, enabled: bool) -> LstInfoAccount {
+        LstInfoAccount {
+            pool: Pubkey::new_unique(),
+            mint,
+            stake_pool: Pubkey::new_unique(),
+            stake_pool_program: Pubkey::new_unique(),
+            bump: 0,
+            is_active: false,
+            last_synced_session_id: 0,
+            enabled,
+            reserved: [0],
+            rate_history_epochs: [0; 5],
+            rate_history_rates: [0; 5],
+            rate_history_len: 0,
+        }
+    }
+
+    #[test]
     fn load_wallet_accepts_pubkey_when_dumping() {
         let pubkey = Pubkey::new_unique();
         let value = pubkey.to_string();
@@ -4543,6 +6364,326 @@ mod tests {
         let value = Pubkey::new_unique().to_string();
 
         assert!(load_wallet(Some(&value), false).is_err());
+    }
+
+    #[test]
+    fn parse_sol_lamports_accepts_decimal_notional() {
+        assert_eq!(parse_sol_lamports("0.1").unwrap(), 100_000_000);
+        assert_eq!(parse_sol_lamports("1").unwrap(), LAMPORTS_PER_SOL);
+        assert_eq!(parse_sol_lamports(".000000001").unwrap(), 1);
+    }
+
+    #[test]
+    fn parse_sol_lamports_rejects_over_precise_notional() {
+        assert!(parse_sol_lamports("0.0000000001").is_err());
+    }
+
+    #[test]
+    fn parse_percent_units_accepts_plain_and_suffixed_percentages() {
+        assert_eq!(parse_percent_units("10", "cap").unwrap(), 100_000);
+        assert_eq!(parse_percent_units("10%", "cap").unwrap(), 100_000);
+        assert_eq!(parse_percent_units("0.125%", "cap").unwrap(), 1_250);
+        assert_eq!(format_percent_units(1_250), "0.125%");
+    }
+
+    #[test]
+    fn parse_percent_units_rejects_invalid_percentages() {
+        assert!(parse_percent_units("100.0001", "cap").is_err());
+        assert!(parse_percent_units("0.00001", "cap").is_err());
+        assert!(parse_percent_units("-1", "cap").is_err());
+    }
+
+    #[test]
+    fn balanced_plan_reduces_lsts_by_current_value_ratio() {
+        let mint_a = Pubkey::new_unique();
+        let mint_b = Pubkey::new_unique();
+        let plan = build_balanced_pool_lst_plan(
+            sol_lamports(50),
+            0,
+            0,
+            0,
+            parse_percent_units("10", "cap").unwrap(),
+            0,
+            vec![
+                test_pool_lst_position(mint_a, sol_lamports(30)),
+                test_pool_lst_position(mint_b, sol_lamports(20)),
+            ],
+            &[],
+        )
+        .unwrap();
+        let positions = plan_positions_by_mint(&plan);
+
+        assert_eq!(
+            plan.current_lst_value_lamports,
+            u128::from(sol_lamports(50))
+        );
+        assert_eq!(plan.tvl_lamports, u128::from(sol_lamports(100)));
+        assert_eq!(plan.target_lst_value_lamports, u128::from(sol_lamports(10)));
+        assert_eq!(plan.new_lst_value_lamports, u128::from(sol_lamports(10)));
+        assert_eq!(positions[&mint_a].target_amount, sol_lamports(6));
+        assert_eq!(positions[&mint_a].unstake_amount, sol_lamports(24));
+        assert_eq!(positions[&mint_b].target_amount, sol_lamports(4));
+        assert_eq!(positions[&mint_b].unstake_amount, sol_lamports(16));
+    }
+
+    #[test]
+    fn balanced_plan_applies_overrides_and_preserves_remaining_ratio() {
+        let mint_a = Pubkey::new_unique();
+        let mint_b = Pubkey::new_unique();
+        let mint_c = Pubkey::new_unique();
+        let plan = build_balanced_pool_lst_plan(
+            sol_lamports(30),
+            0,
+            0,
+            0,
+            parse_percent_units("10", "cap").unwrap(),
+            0,
+            vec![
+                test_pool_lst_position(mint_a, sol_lamports(30)),
+                test_pool_lst_position(mint_b, sol_lamports(20)),
+                test_pool_lst_position(mint_c, sol_lamports(20)),
+            ],
+            &[PoolLstTargetOverride {
+                mint: mint_a,
+                percent: parse_percent_units("2", "override").unwrap(),
+            }],
+        )
+        .unwrap();
+        let positions = plan_positions_by_mint(&plan);
+
+        assert_eq!(plan.tvl_lamports, u128::from(sol_lamports(100)));
+        assert_eq!(plan.new_lst_value_lamports, u128::from(sol_lamports(10)));
+        assert_eq!(positions[&mint_a].target_amount, sol_lamports(2));
+        assert_eq!(positions[&mint_b].target_amount, sol_lamports(4));
+        assert_eq!(positions[&mint_c].target_amount, sol_lamports(4));
+    }
+
+    #[test]
+    fn balanced_plan_rejects_overrides_above_global_cap() {
+        let mint_a = Pubkey::new_unique();
+        let err = build_balanced_pool_lst_plan(
+            sol_lamports(40),
+            0,
+            0,
+            0,
+            parse_percent_units("10", "cap").unwrap(),
+            0,
+            vec![test_pool_lst_position(mint_a, sol_lamports(60))],
+            &[PoolLstTargetOverride {
+                mint: mint_a,
+                percent: parse_percent_units("20", "override").unwrap(),
+            }],
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("above global LST cap"));
+    }
+
+    #[test]
+    fn balanced_plan_does_not_reduce_until_trigger_buffer_is_exceeded() {
+        let mint = Pubkey::new_unique();
+        let plan = build_balanced_pool_lst_plan(
+            sol_lamports(94) + 950_000_000,
+            0,
+            0,
+            0,
+            parse_percent_units("5", "cap").unwrap(),
+            0,
+            vec![test_pool_lst_position(mint, sol_lamports(5) + 50_000_000)],
+            &[],
+        )
+        .unwrap();
+        let positions = plan_positions_by_mint(&plan);
+
+        assert_eq!(
+            plan.trigger_percent,
+            parse_percent_units("5.1", "cap").unwrap()
+        );
+        assert_eq!(positions[&mint].target_amount, sol_lamports(5) + 50_000_000);
+        assert_eq!(positions[&mint].unstake_amount, 0);
+    }
+
+    #[test]
+    fn balanced_plan_skip_message_reports_trigger_buffer_not_exceeded() {
+        let mint = Pubkey::new_unique();
+        let plan = build_balanced_pool_lst_plan(
+            sol_lamports(94) + 950_000_000,
+            0,
+            0,
+            0,
+            parse_percent_units("5", "cap").unwrap(),
+            0,
+            vec![test_pool_lst_position(mint, sol_lamports(5) + 50_000_000)],
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(
+            balanced_pool_lst_skip_message(&plan).as_deref(),
+            Some("Current LST value 5.05% is less than trigger 5.1%; skipping unstakes")
+        );
+    }
+
+    #[test]
+    fn balanced_plan_does_not_mark_dust_when_trigger_buffer_is_not_exceeded() {
+        let mint = Pubkey::new_unique();
+        let half_sol = LAMPORTS_PER_SOL / 2;
+        let plan = build_balanced_pool_lst_plan(
+            sol_lamports(99) + half_sol,
+            0,
+            0,
+            0,
+            parse_percent_units("1", "cap").unwrap(),
+            LAMPORTS_PER_SOL,
+            vec![test_pool_lst_position(mint, half_sol)],
+            &[],
+        )
+        .unwrap();
+        let positions = plan_positions_by_mint(&plan);
+
+        assert_eq!(positions[&mint].target_amount, half_sol);
+        assert_eq!(positions[&mint].unstake_amount, 0);
+        assert_eq!(positions[&mint].note, None);
+    }
+
+    #[test]
+    fn balanced_plan_does_not_apply_override_until_trigger_buffer_is_exceeded() {
+        let mint_a = Pubkey::new_unique();
+        let mint_b = Pubkey::new_unique();
+        let plan = build_balanced_pool_lst_plan(
+            sol_lamports(70),
+            0,
+            0,
+            0,
+            parse_percent_units("40", "cap").unwrap(),
+            0,
+            vec![
+                test_pool_lst_position(mint_a, sol_lamports(20)),
+                test_pool_lst_position(mint_b, sol_lamports(10)),
+            ],
+            &[PoolLstTargetOverride {
+                mint: mint_a,
+                percent: parse_percent_units("5", "override").unwrap(),
+            }],
+        )
+        .unwrap();
+        let positions = plan_positions_by_mint(&plan);
+
+        assert_eq!(plan.tvl_lamports, u128::from(sol_lamports(100)));
+        assert_eq!(plan.new_lst_value_lamports, u128::from(sol_lamports(30)));
+        assert_eq!(positions[&mint_a].target_amount, sol_lamports(20));
+        assert_eq!(positions[&mint_a].unstake_amount, 0);
+        assert_eq!(positions[&mint_b].target_amount, sol_lamports(10));
+        assert_eq!(positions[&mint_b].unstake_amount, 0);
+    }
+
+    #[test]
+    fn balanced_plan_unstakes_all_when_target_is_less_than_one_sol() {
+        let mint = Pubkey::new_unique();
+        let plan = build_balanced_pool_lst_plan(
+            sol_lamports(98),
+            0,
+            0,
+            0,
+            parse_percent_units("0.5", "cap").unwrap(),
+            0,
+            vec![test_pool_lst_position(mint, sol_lamports(2))],
+            &[],
+        )
+        .unwrap();
+        let positions = plan_positions_by_mint(&plan);
+
+        assert_eq!(positions[&mint].target_amount, 0);
+        assert_eq!(positions[&mint].unstake_amount, sol_lamports(2));
+        assert_eq!(
+            positions[&mint].note.as_deref(),
+            Some("target below 1 SOL; planning full LST unstake")
+        );
+    }
+
+    #[test]
+    fn balanced_plan_skips_unstake_when_full_balance_is_below_minimum_split() {
+        let mint = Pubkey::new_unique();
+        let half_sol = LAMPORTS_PER_SOL / 2;
+        let plan = build_balanced_pool_lst_plan(
+            sol_lamports(99),
+            0,
+            0,
+            0,
+            parse_percent_units("0", "cap").unwrap(),
+            LAMPORTS_PER_SOL,
+            vec![test_pool_lst_position(mint, half_sol)],
+            &[],
+        )
+        .unwrap();
+        let positions = plan_positions_by_mint(&plan);
+
+        assert_eq!(positions[&mint].target_amount, half_sol);
+        assert_eq!(positions[&mint].unstake_amount, 0);
+        assert!(positions[&mint]
+            .note
+            .as_deref()
+            .unwrap()
+            .contains("below minimum"));
+    }
+
+    #[test]
+    fn advantage_bps_is_positive_when_v3_is_better() {
+        assert_eq!(advantage_bps(1_000, 100_000), Some(100.0));
+        assert_eq!(advantage_bps(-500, 100_000), Some(-50.0));
+        assert_eq!(advantage_bps(1, 0), None);
+    }
+
+    #[test]
+    fn csv_render_can_omit_header_for_polling() {
+        let record = CompareRecord {
+            timestamp_unix: 1,
+            pool: Pubkey::new_unique(),
+            mint: Pubkey::new_unique(),
+            direction: CompareDirection::SolToLst,
+            notional_sol_lamports: LAMPORTS_PER_SOL,
+            lst_amount: Some(2),
+            jupiter_sol_lamports: Some(3),
+            jupiter_lst_amount: Some(2),
+            v3_sol_lamports: Some(1),
+            v3_lst_amount: Some(2),
+            v3_advantage_lamports: Some(2),
+            v3_advantage_bps: Some(3.0),
+            jupiter_route: vec!["Route".to_string()],
+            error: None,
+        };
+
+        let with_header = render_csv_compare_records(std::slice::from_ref(&record), true);
+        assert!(with_header.starts_with(csv_compare_header()));
+
+        let without_header = render_csv_compare_records(&[record], false);
+        assert!(!without_header.starts_with(csv_compare_header()));
+        assert!(without_header.ends_with(",true\n"));
+    }
+
+    fn test_pool_lst_position(mint: Pubkey, value: u64) -> PoolLstPositionSnapshot {
+        PoolLstPositionSnapshot {
+            mint,
+            amount: value,
+            sol_value: value,
+            stake_pool_program_id: spl_stake_pool::id(),
+            stake_pool_total_lamports: 1,
+            stake_pool_token_supply: 1,
+            stake_withdrawal_fee: spl_stake_pool::state::Fee::default(),
+        }
+    }
+
+    fn sol_lamports(sol: u64) -> u64 {
+        sol.checked_mul(LAMPORTS_PER_SOL).unwrap()
+    }
+
+    fn plan_positions_by_mint(
+        plan: &BalancedPoolLstPlan,
+    ) -> HashMap<Pubkey, &BalancedPoolLstPlanPosition> {
+        plan.positions
+            .iter()
+            .map(|position| (position.mint, position))
+            .collect()
     }
 
     #[test]

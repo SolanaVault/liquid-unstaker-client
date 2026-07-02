@@ -1,3 +1,6 @@
 /target
 *.json
 
+*.csv
+*.txt
+*.sh
