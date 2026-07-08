@@ -23,6 +23,7 @@ This CLI targets v3 of the Liquid Unstaker protocol.
 
 - `initialize-pool`, initialize a v3 pool at the supplied pool PDA
 - `upsert-lst-info`, create/update a v3 LST allowlist entry
+- `create-idempotent-pool-token-accounts`, create missing pool-owned token accounts for enabled LSTs
 - `sync-inventory`, refresh the v3 inventory summary for active LST inventory
 - `unstake-pool-lsts`, authority-only batch unstake of pool-owned LST inventory
 - `list-pool-lsts`, list non-zero pool-owned LST balances from configured LST info entries
@@ -125,6 +126,19 @@ liquid-unstaker-client-cli \
   --rpc "$RPC_URL" \
   --keypair "$AUTHORITY_KEYPAIR_PATH" \
   upsert-lst-info <LST_MINT>
+```
+
+### Create pool LST token accounts
+
+Creates any missing pool-owned token accounts for enabled v3 LST entries, including enabled entries
+that are not currently active.
+
+```sh
+liquid-unstaker-client-cli \
+  --pool <POOL> \
+  --rpc "$RPC_URL" \
+  --keypair "$PAYER_KEYPAIR_PATH" \
+  create-idempotent-pool-token-accounts --chunk-size 8
 ```
 
 ### Show the LP token price

@@ -622,6 +622,14 @@ async fn main() -> Result<()> {
                 ),
         )
         .subcommand(
+            Command::new("create-idempotent-pool-token-accounts")
+                .about("Create missing pool-owned token accounts for enabled v3 LST entries")
+                .arg(optional_u64_arg(
+                    "chunk-size",
+                    "Token accounts to create per transaction. Defaults to 8",
+                )),
+        )
+        .subcommand(
             Command::new("inventory-status")
                 .about("Report whether the v3 inventory summary is current without syncing"),
         )
@@ -1028,6 +1036,19 @@ async fn main() -> Result<()> {
                     .copied()
                     .unwrap_or(8) as usize,
                 arg_matches.get_flag("abort"),
+                simulate,
+            )
+            .await?;
+        }
+        Some(("create-idempotent-pool-token-accounts", arg_matches)) => {
+            create_idempotent_pool_token_accounts(
+                &program,
+                &unstake_pool_id,
+                &wallet_keypair,
+                arg_matches
+                    .get_one::<u64>("chunk-size")
+                    .copied()
+                    .unwrap_or(DEFAULT_UPDATE_CHUNK_SIZE as u64) as usize,
                 simulate,
             )
             .await?;
@@ -2779,6 +2800,155 @@ async fn upsert_lst_info(
     .await
 }
 
+struct PoolTokenAccountEntry {
+    lst_info: Pubkey,
+    mint: Pubkey,
+    pool_lst_token_account: Pubkey,
+    is_active: bool,
+}
+
+async fn create_idempotent_pool_token_accounts(
+    program: &ProgramClient,
+    pool_id: &Pubkey,
+    wallet: &Wallet,
+    chunk_size: usize,
+    simulate: bool,
+) -> Result<()> {
+    if chunk_size == 0 {
+        return Err(anyhow!("chunk-size must be greater than 0"));
+    }
+
+    let enabled_entries = list_lst_infos(&program.rpc(), pool_id)
+        .await?
+        .into_iter()
+        .filter(|(_, lst_info)| lst_info.enabled)
+        .map(|(lst_info_address, lst_info)| PoolTokenAccountEntry {
+            lst_info: lst_info_address,
+            mint: lst_info.mint,
+            pool_lst_token_account: token_account_address(pool_id, &lst_info.mint),
+            is_active: lst_info.is_active,
+        })
+        .collect_vec();
+
+    println!(
+        "Checking {} enabled v3 LST entries for pool-owned token accounts",
+        enabled_entries.len()
+    );
+
+    if enabled_entries.is_empty() {
+        println!("No enabled v3 LST entries found");
+        return Ok(());
+    }
+
+    let mut existing_count = 0usize;
+    let mut missing_entries = Vec::new();
+
+    for chunk in enabled_entries.chunks(100) {
+        let token_accounts = chunk
+            .iter()
+            .map(|entry| entry.pool_lst_token_account)
+            .collect_vec();
+        let accounts = program.rpc().get_multiple_accounts(&token_accounts).await?;
+
+        for (entry, account) in chunk.iter().zip(accounts) {
+            if let Some(account) = account {
+                validate_pool_token_account(pool_id, entry, &account)?;
+                existing_count += 1;
+            } else {
+                missing_entries.push(PoolTokenAccountEntry {
+                    lst_info: entry.lst_info,
+                    mint: entry.mint,
+                    pool_lst_token_account: entry.pool_lst_token_account,
+                    is_active: entry.is_active,
+                });
+            }
+        }
+    }
+
+    println!("  existing_pool_token_accounts={existing_count}");
+    println!("  missing_pool_token_accounts={}", missing_entries.len());
+
+    if missing_entries.is_empty() {
+        println!("All enabled v3 LST pool token accounts already exist");
+        return Ok(());
+    }
+
+    println!("mint,pool_token_account,lst_info,is_active");
+    for entry in &missing_entries {
+        println!(
+            "{},{},{},{}",
+            entry.mint, entry.pool_lst_token_account, entry.lst_info, entry.is_active
+        );
+    }
+
+    let chunk_count = missing_entries.len().div_ceil(chunk_size);
+    for (chunk_index, chunk) in missing_entries.chunks(chunk_size).enumerate() {
+        println!(
+            "Creating {} missing pool token accounts in transaction {}/{}",
+            chunk.len(),
+            chunk_index + 1,
+            chunk_count
+        );
+        let instructions = chunk
+            .iter()
+            .map(|entry| create_ata_idempotent_ix(&wallet.pubkey(), pool_id, &entry.mint))
+            .collect_vec();
+        let simulation_accounts = chunk
+            .iter()
+            .map(|entry| entry.pool_lst_token_account)
+            .collect_vec();
+
+        send_instructions(
+            program,
+            wallet,
+            instructions,
+            &[],
+            simulate,
+            Some(simulation_accounts),
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+fn validate_pool_token_account(
+    pool_id: &Pubkey,
+    entry: &PoolTokenAccountEntry,
+    account: &solana_sdk::account::Account,
+) -> Result<()> {
+    if account.owner != spl_token::id() {
+        return Err(anyhow!(
+            "pool token account {} for mint {} exists but is owned by {} instead of {}",
+            entry.pool_lst_token_account,
+            entry.mint,
+            account.owner,
+            spl_token::id()
+        ));
+    }
+
+    let token_account = spl_token::state::Account::unpack(&account.data)?;
+    if token_account.owner != *pool_id {
+        return Err(anyhow!(
+            "pool token account {} for mint {} exists but has token owner {} instead of {}",
+            entry.pool_lst_token_account,
+            entry.mint,
+            token_account.owner,
+            pool_id
+        ));
+    }
+    if token_account.mint != entry.mint {
+        return Err(anyhow!(
+            "pool token account {} exists but has mint {} instead of {}",
+            entry.pool_lst_token_account,
+            token_account.mint,
+            entry.mint
+        ));
+    }
+
+    Ok(())
+}
+
 async fn sync_inventory(
     program: &ProgramClient,
     pool_id: &Pubkey,
@@ -2815,15 +2985,47 @@ async fn sync_inventory(
             return Ok(());
         }
 
+        let summary =
+            fetch_anchor_account::<InventorySummaryAccount>(&program.rpc(), &inventory_summary)
+                .await?;
+        let sync_in_progress = summary
+            .as_ref()
+            .map(|summary| summary.sync_in_progress)
+            .unwrap_or(false);
+        let (entries, resume_info) = pending_inventory_entries_for_sync(
+            entries,
+            sync_in_progress,
+            pool.inventory_sync_session_id,
+        );
+        if let Some(resume_info) = resume_info.as_ref() {
+            println!(
+                "Continuing inventory sync session {}: {}/{} active entries already processed; {} remaining",
+                resume_info.session_id,
+                resume_info.already_synced,
+                resume_info.total,
+                entries.len()
+            );
+        }
+
         if entries.is_empty() {
-            println!("No active v3 LST inventory entries found for sync");
+            if resume_info.is_some() {
+                println!(
+                    "No remaining active v3 LST inventory entries found for this sync session"
+                );
+            } else {
+                println!("No active v3 LST inventory entries found for sync");
+            }
             vec![vec![]]
         } else {
             println!("Syncing {} active v3 LST inventory entries:", entries.len());
             for entry in &entries {
                 println!(
-                    "  mint={} stake_pool={} pool_lst_token_account={} lst_info={}",
-                    entry.mint, entry.stake_pool, entry.pool_lst_token_account, entry.lst_info
+                    "  mint={} stake_pool={} pool_lst_token_account={} lst_info={} last_synced_session_id={}",
+                    entry.mint,
+                    entry.stake_pool,
+                    entry.pool_lst_token_account,
+                    entry.lst_info,
+                    entry.last_synced_session_id
                 );
             }
             entries
@@ -3208,6 +3410,7 @@ struct InventoryEntry {
     pool_lst_token_account: Pubkey,
     stake_pool: Pubkey,
     lst_info: Pubkey,
+    last_synced_session_id: u32,
     rate_history_epochs: [u64; 5],
     rate_history_rates: [u64; 5],
     rate_history_len: u8,
@@ -3216,6 +3419,35 @@ struct InventoryEntry {
 enum InventoryValueCheck {
     CurrentValue(u64),
     NeedsSync(String),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct InventorySyncResumeInfo {
+    session_id: u32,
+    already_synced: usize,
+    total: usize,
+}
+
+fn pending_inventory_entries_for_sync(
+    entries: Vec<InventoryEntry>,
+    sync_in_progress: bool,
+    session_id: u32,
+) -> (Vec<InventoryEntry>, Option<InventorySyncResumeInfo>) {
+    if !sync_in_progress {
+        return (entries, None);
+    }
+
+    let total = entries.len();
+    let (already_synced_entries, pending_entries): (Vec<_>, Vec<_>) = entries
+        .into_iter()
+        .partition(|entry| entry.last_synced_session_id == session_id);
+    let resume_info = InventorySyncResumeInfo {
+        session_id,
+        already_synced: already_synced_entries.len(),
+        total,
+    };
+
+    (pending_entries, Some(resume_info))
 }
 
 fn active_inventory_entries_from_records(
@@ -3237,6 +3469,7 @@ fn active_inventory_entries_from_records(
             pool_lst_token_account,
             stake_pool: lst_info.stake_pool,
             lst_info: record.address,
+            last_synced_session_id: lst_info.last_synced_session_id,
             rate_history_epochs: lst_info.rate_history_epochs,
             rate_history_rates: lst_info.rate_history_rates,
             rate_history_len: lst_info.rate_history_len,
@@ -6300,6 +6533,60 @@ mod tests {
             Some(true)
         );
         assert_eq!(lst_info_version(data.len()), "v2");
+    }
+
+    #[test]
+    fn pending_inventory_entries_keeps_all_entries_when_not_resuming() {
+        let current_session_id = 42;
+        let entries = vec![
+            test_inventory_entry(current_session_id),
+            test_inventory_entry(current_session_id - 1),
+        ];
+
+        let (pending_entries, resume_info) =
+            pending_inventory_entries_for_sync(entries, false, current_session_id);
+
+        assert_eq!(pending_entries.len(), 2);
+        assert_eq!(resume_info, None);
+    }
+
+    #[test]
+    fn pending_inventory_entries_skips_entries_already_synced_in_current_session() {
+        let current_session_id = 42;
+        let old_entry = test_inventory_entry(current_session_id - 1);
+        let never_synced_entry = test_inventory_entry(0);
+        let already_synced_entry = test_inventory_entry(current_session_id);
+        let expected_pending_mints = vec![old_entry.mint, never_synced_entry.mint];
+        let entries = vec![already_synced_entry, old_entry, never_synced_entry];
+
+        let (pending_entries, resume_info) =
+            pending_inventory_entries_for_sync(entries, true, current_session_id);
+
+        assert_eq!(
+            pending_entries.iter().map(|entry| entry.mint).collect_vec(),
+            expected_pending_mints
+        );
+        assert_eq!(
+            resume_info,
+            Some(InventorySyncResumeInfo {
+                session_id: current_session_id,
+                already_synced: 1,
+                total: 3,
+            })
+        );
+    }
+
+    fn test_inventory_entry(last_synced_session_id: u32) -> InventoryEntry {
+        InventoryEntry {
+            mint: Pubkey::new_unique(),
+            pool_lst_token_account: Pubkey::new_unique(),
+            stake_pool: Pubkey::new_unique(),
+            lst_info: Pubkey::new_unique(),
+            last_synced_session_id,
+            rate_history_epochs: [0; 5],
+            rate_history_rates: [0; 5],
+            rate_history_len: 0,
+        }
     }
 
     #[test]
