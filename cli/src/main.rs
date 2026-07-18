@@ -79,6 +79,8 @@ const DEFAULT_JUPITER_EXCLUDED_DEX: &str = "VaultLiquidUnstake";
 const PERCENT_SCALE: u128 = 1_000_000;
 const PERCENT_UNITS_PER_ONE_PERCENT: u128 = PERCENT_SCALE / 100;
 const BALANCED_LST_CAP_TRIGGER_BUFFER_PERCENT: u32 = 1_000;
+const BALANCED_LST_UNSTAKE_MAX_RETRIES: usize = 10;
+const BALANCED_LST_UNSTAKE_RETRY_DELAY: Duration = Duration::from_secs(20);
 const MPL_TOKEN_METADATA_PROGRAM: Pubkey = pubkey!("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s");
 const ANCHOR_DISCRIMINATOR_LEN: usize = 8;
 const PUBKEY_DATA_LEN: usize = 32;
@@ -162,6 +164,11 @@ struct PoolLstUnstakeRequest {
     mint: Pubkey,
     amount: u64,
     stake_pool_program_id: Option<Pubkey>,
+}
+
+struct PoolLstUnstakeSubmission {
+    new_stake_account_count: usize,
+    send_result: Result<()>,
 }
 
 #[derive(Clone, Debug)]
@@ -678,6 +685,10 @@ async fn main() -> Result<()> {
                 .arg(optional_u64_arg(
                     "stake-account-seed",
                     "Seed for destination stake account PDAs. Defaults to pool.total_deactivating_stake",
+                ))
+                .arg(optional_u64_arg(
+                    "priority-fee-micro-lamports",
+                    "Priority fee in micro-lamports per compute unit",
                 )),
         )
         .subcommand(
@@ -1099,6 +1110,9 @@ async fn main() -> Result<()> {
                 cap_percent,
                 &overrides,
                 arg_matches.get_one::<u64>("stake-account-seed").copied(),
+                arg_matches
+                    .get_one::<u64>("priority-fee-micro-lamports")
+                    .copied(),
                 simulate,
             )
             .await?;
@@ -3770,6 +3784,7 @@ async fn unstake_pool_lsts_balanced(
     cap_percent: u32,
     overrides: &[PoolLstTargetOverride],
     stake_account_seed: Option<u64>,
+    priority_fee_micro_lamports: Option<u64>,
     simulate: bool,
 ) -> Result<()> {
     let epoch_progress = get_epoch_progress(&program.rpc()).await?;
@@ -3825,6 +3840,9 @@ async fn unstake_pool_lsts_balanced(
         wallet,
         requests,
         stake_account_seed,
+        priority_fee_micro_lamports,
+        BALANCED_LST_UNSTAKE_MAX_RETRIES,
+        true,
         simulate,
     )
     .await
@@ -4274,6 +4292,9 @@ async fn unstake_pool_lsts_for_selection(
         wallet,
         requests,
         stake_account_seed,
+        None,
+        0,
+        false,
         simulate,
     )
     .await
@@ -4285,26 +4306,53 @@ async fn execute_pool_lst_unstake_requests(
     wallet: &Wallet,
     requests: Vec<PoolLstUnstakeRequest>,
     stake_account_seed: Option<u64>,
+    priority_fee_micro_lamports: Option<u64>,
+    max_retries: usize,
+    continue_on_failure: bool,
     simulate: bool,
 ) -> Result<()> {
     let mut next_stake_account_seed = stake_account_seed;
+    let mut failed_requests = Vec::new();
     for request in requests {
-        let pool = fetch_pool(program, *pool_id).await?;
+        let pool = match fetch_pool(program, *pool_id).await {
+            Ok(pool) => pool,
+            Err(error) if continue_on_failure => {
+                eprintln!(
+                    "Failed to refresh pool before unstaking mint {}: {error:#}. Continuing with the next mint",
+                    request.mint
+                );
+                failed_requests.push(request.mint);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         let seed = next_stake_account_seed.unwrap_or(pool.total_deactivating_stake);
-        let stake_pool_program_id =
-            if let Some(stake_pool_program_id) = request.stake_pool_program_id {
-                stake_pool_program_id
-            } else {
-                get_stake_pool_for_mint_from_supported_programs(&program.rpc(), &request.mint)
-                    .await?
-                    .0
-            };
+        let stake_pool_program_id = if let Some(stake_pool_program_id) =
+            request.stake_pool_program_id
+        {
+            stake_pool_program_id
+        } else {
+            match get_stake_pool_for_mint_from_supported_programs(&program.rpc(), &request.mint)
+                .await
+            {
+                Ok((stake_pool_program_id, _)) => stake_pool_program_id,
+                Err(error) if continue_on_failure => {
+                    eprintln!(
+                        "Failed to resolve stake pool for mint {}: {error:#}. Continuing with the next mint",
+                        request.mint
+                    );
+                    failed_requests.push(request.mint);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        };
 
         println!(
             "Unstaking {} tokens for mint {}",
             request.amount, request.mint
         );
-        let new_stake_account_count = unstake_pool_lsts(
+        let submission = unstake_pool_lsts(
             program,
             pool_id,
             wallet,
@@ -4313,16 +4361,50 @@ async fn execute_pool_lst_unstake_requests(
             &pool,
             request.amount,
             seed,
+            priority_fee_micro_lamports,
+            max_retries,
             simulate,
         )
-        .await?;
+        .await;
+
+        let submission = match submission {
+            Ok(submission) => submission,
+            Err(error) if continue_on_failure => {
+                eprintln!(
+                    "Failed to prepare unstake for mint {}: {error:#}. Continuing with the next mint",
+                    request.mint
+                );
+                failed_requests.push(request.mint);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
 
         if stake_account_seed.is_some() || simulate {
             next_stake_account_seed = Some(
-                seed.checked_add(new_stake_account_count as u64)
+                seed.checked_add(submission.new_stake_account_count as u64)
                     .ok_or_else(|| anyhow!("stake-account-seed overflow"))?,
             );
         }
+
+        if let Err(error) = submission.send_result {
+            if !continue_on_failure {
+                return Err(error);
+            }
+            eprintln!(
+                "Failed to unstake mint {} after transaction retries: {error:#}. Continuing with the next mint",
+                request.mint
+            );
+            failed_requests.push(request.mint);
+        }
+    }
+
+    if !failed_requests.is_empty() {
+        eprintln!(
+            "Balanced LST unstake completed with {} failed mint(s): {}",
+            failed_requests.len(),
+            failed_requests.iter().join(", ")
+        );
     }
 
     Ok(())
@@ -4383,8 +4465,10 @@ async fn unstake_pool_lsts(
     pool: &PoolAccount,
     amount: u64,
     stake_account_seed: u64,
+    priority_fee_micro_lamports: Option<u64>,
+    max_retries: usize,
     simulate: bool,
-) -> Result<usize> {
+) -> Result<PoolLstUnstakeSubmission> {
     let rpc = program.rpc();
     let (spl_stake_pool_address, spl_stake_pool_state) =
         get_stake_pool_for_lst_mint(&rpc, mint, spl_stake_pool_program_id).await?;
@@ -4421,8 +4505,15 @@ async fn unstake_pool_lsts(
 
     let mut instructions = vec![
         solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(1_000_000),
-        create_ata_idempotent_ix(&wallet.pubkey(), pool_id, mint),
     ];
+    if let Some(micro_lamports) = priority_fee_micro_lamports {
+        instructions.push(
+            solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_price(
+                micro_lamports,
+            ),
+        );
+    }
+    instructions.push(create_ata_idempotent_ix(&wallet.pubkey(), pool_id, mint));
     instructions.extend(
         program
             .request()
@@ -4465,22 +4556,40 @@ async fn unstake_pool_lsts(
             .instructions()?,
     );
 
-    send_instructions(
-        program,
-        wallet,
-        instructions,
-        &[],
-        simulate,
-        Some(vec![
-            wallet.pubkey(),
-            pool_lst_token_account,
-            pool.sol_vault,
-            new_stake_accounts[0].pubkey(),
-        ]),
-    )
-    .await?;
+    let simulation_accounts = Some(vec![
+        wallet.pubkey(),
+        pool_lst_token_account,
+        pool.sol_vault,
+        new_stake_accounts[0].pubkey(),
+    ]);
+    let send_result = if max_retries == 0 {
+        send_instructions(
+            program,
+            wallet,
+            instructions,
+            &[],
+            simulate,
+            simulation_accounts,
+        )
+        .await
+    } else {
+        send_instructions_with_retries(
+            program,
+            wallet,
+            instructions,
+            &[],
+            simulate,
+            simulation_accounts,
+            max_retries,
+            BALANCED_LST_UNSTAKE_RETRY_DELAY,
+        )
+        .await
+    };
 
-    Ok(new_stake_account_count)
+    Ok(PoolLstUnstakeSubmission {
+        new_stake_account_count,
+        send_result,
+    })
 }
 
 async fn update_pool(
@@ -4986,6 +5095,159 @@ async fn send_instructions(
         simulation_accounts_of_interest,
     )
     .await
+}
+
+async fn send_instructions_with_retries(
+    program: &ProgramClient,
+    payer: &Wallet,
+    instructions: Vec<Instruction>,
+    extra_signers: &[&Keypair],
+    simulate: bool,
+    simulation_accounts_of_interest: Option<Vec<Pubkey>>,
+    max_retries: usize,
+    retry_delay: Duration,
+) -> Result<()> {
+    if simulate || DUMP_TRANSACTION_MESSAGE.load(Ordering::Relaxed) {
+        return send_instructions(
+            program,
+            payer,
+            instructions,
+            extra_signers,
+            simulate,
+            simulation_accounts_of_interest,
+        )
+        .await;
+    }
+
+    let rpc = program.rpc();
+    let payer_pubkey = payer.pubkey();
+    let mut signers = vec![payer.keypair("sending a transaction")?];
+    signers.extend_from_slice(extra_signers);
+
+    let mut recent_blockhash = rpc.get_latest_blockhash().await?;
+    let mut tx = Transaction::new_signed_with_payer(
+        &instructions,
+        Some(&payer_pubkey),
+        &signers,
+        recent_blockhash,
+    );
+    let total_attempts = max_retries
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("transaction retry count overflow"))?;
+
+    for attempt in 0..total_attempts {
+        let signature = tx.signatures[0];
+        match rpc.send_and_confirm_transaction(&tx).await {
+            Ok(confirmed_signature) => {
+                println!("Signature: {confirmed_signature}");
+                return Ok(());
+            }
+            Err(send_error) => {
+                eprintln!(
+                    "Transaction attempt {}/{} failed for signature {}: {}",
+                    attempt + 1,
+                    total_attempts,
+                    signature,
+                    send_error
+                );
+                eprintln!(
+                    "Waiting {} seconds before checking whether the transaction landed",
+                    retry_delay.as_secs()
+                );
+                tokio::time::sleep(retry_delay).await;
+
+                // Any observed execution must stop retries, even before higher commitment levels.
+                let status = rpc
+                    .get_signature_status_with_commitment_and_history(
+                        &signature,
+                        solana_sdk::commitment_config::CommitmentConfig::processed(),
+                        true,
+                    )
+                    .await
+                    .map_err(|status_error| {
+                        anyhow!(
+                            "transaction {} failed and its landing status could not be verified: {}; original send error: {}",
+                            signature,
+                            status_error,
+                            send_error
+                        )
+                    })?;
+                match status {
+                    Some(Ok(())) => {
+                        println!(
+                            "Signature: {signature} (landed despite the earlier confirmation error)"
+                        );
+                        return Ok(());
+                    }
+                    Some(Err(transaction_error)) => {
+                        return Err(anyhow!(
+                            "transaction {} landed but failed: {:?}; original send error: {}",
+                            signature,
+                            transaction_error,
+                            send_error
+                        ));
+                    }
+                    None => {
+                        eprintln!("Signature {signature} was not found in transaction history");
+                    }
+                }
+
+                if attempt == max_retries {
+                    return Err(anyhow!(
+                        "transaction did not land after {} retries; last signature: {}; last send error: {}",
+                        max_retries,
+                        signature,
+                        send_error
+                    ));
+                }
+
+                match rpc
+                    .is_blockhash_valid(
+                        &recent_blockhash,
+                        solana_sdk::commitment_config::CommitmentConfig::processed(),
+                    )
+                    .await
+                {
+                    Ok(true) => {
+                        eprintln!(
+                            "Retrying the same signed transaction ({}/{})",
+                            attempt + 1,
+                            max_retries
+                        );
+                    }
+                    Ok(false) => match rpc.get_latest_blockhash().await {
+                        Ok(blockhash) => {
+                            recent_blockhash = blockhash;
+                            tx = Transaction::new_signed_with_payer(
+                                &instructions,
+                                Some(&payer_pubkey),
+                                &signers,
+                                recent_blockhash,
+                            );
+                            eprintln!(
+                                "The previous blockhash expired; retrying with signature {} ({}/{})",
+                                tx.signatures[0],
+                                attempt + 1,
+                                max_retries
+                            );
+                        }
+                        Err(blockhash_error) => {
+                            eprintln!(
+                                "Unable to fetch a fresh blockhash: {blockhash_error}. The next retry will reuse signature {signature}"
+                            );
+                        }
+                    },
+                    Err(blockhash_error) => {
+                        eprintln!(
+                            "Unable to check whether the blockhash is still valid: {blockhash_error}. The next retry will reuse signature {signature}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    unreachable!("transaction retry loop always returns")
 }
 
 fn encode_transaction_message(tx: &Transaction) -> String {

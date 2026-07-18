@@ -225,8 +225,11 @@ liquid-unstaker-client-cli \
   --pool <POOL> \
   --rpc "$RPC_URL" \
   --keypair "$MAINTENANCE_AUTHORITY_KEYPAIR_PATH" \
-  unstake-pools-lsts-balanced 10%
+  unstake-pools-lsts-balanced 10% \
+  --priority-fee-micro-lamports 10000
 ```
+
+The optional priority fee is specified in micro-lamports per compute unit. A failed balanced-unstake transaction is checked again after 20 seconds and retried up to 10 times if its signature did not land. A transaction that still fails after all retries is reported, and the command continues processing the remaining LST mints.
 
 Repeat `--lst-target <MINT>:<PERCENT>` to override a mint's remaining target as a percentage of total pool TVL. Non-overridden LSTs share the remaining global cap in their current SOL-value ratio.
 
